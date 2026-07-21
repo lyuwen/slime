@@ -166,7 +166,7 @@ Methods:
 - **`write_config(sb, ctx)`** — write under user `agent`:
   - `/home/agent/oh_driver.py` — the loop (see §6).
   - `/home/agent/oh_config.json` — `{adapter_url, session_id, model_label,
-    workdir, fake_user, max_iterations}`.
+    workdir, fake_user, max_iterations, tools}`.
   - `/home/agent/oh_prompt.txt` — the task prompt (passed via file to avoid
     shell-quoting a long problem statement).
 - **`launch_and_wait(sb, ctx, prompt, time_budget_sec)`** —
@@ -178,6 +178,8 @@ Methods:
 - `SWE_OH_FAKE_USER` (default `0`)
 - `SWE_OH_MAX_ITERATIONS` (default matches the benchmark's `--max-iterations`,
   e.g. 100)
+- `SWE_OH_TOOLS` (default `file_editor,terminal,task_tracker,think,finish`) —
+  externally-specified tool allowlist, see §6.1.
 
 ---
 
@@ -192,14 +194,17 @@ prompt = open("/home/agent/oh_prompt.txt").read()
 
 from openhands.sdk import LLM, Agent, Conversation
 from openhands.sdk.workspace import LocalWorkspace
-from openhands.tools.preset.default import get_default_tools
+from openhands.sdk.tool import Tool
+
+tools, include_default = build_tools(cfg["tools"])   # see §6.1
 
 llm = LLM(
     model="openai/slime-actor",          # openai/* → litellm OpenAI-compatible path
     base_url=cfg["adapter_url"] + "/v1",  # slime OpenAIAdapter
     api_key=cfg["session_id"],            # → Authorization: Bearer → adapter session key
 )
-agent = Agent(llm=llm, tools=get_default_tools(enable_browser=False),
+agent = Agent(llm=llm, tools=tools,
+              include_default_tools=include_default,   # controls Think/Finish
               system_prompt_kwargs={"cli_mode": True})
 conv = Conversation(agent=agent, workspace=LocalWorkspace(cfg["workdir"]),
                     max_iteration_per_run=cfg["max_iterations"])
@@ -217,10 +222,47 @@ path is `conv.run()`. For the nudge path, **vendor the ~40-line helper into
 `oh_driver.py`** (preferred — keeps the driver self-contained) rather than depend
 on benchmark utils being on the baked env.
 
-**Tool selection:** `get_default_tools(enable_browser=False)` = Terminal +
-FileEditor + TaskTracker. Matches the benchmark's default (non-legacy) tool set.
-A `SWE_OH_LEGACY_TOOLS` knob (→ `get_legacy_tools`) may be added later for
-ablation parity; out of scope for v1.
+### 6.1 Externally-specified tool allowlist
+
+The set of tools is **configurable from outside** (env → `cfg["tools"]`), not
+hardcoded. Two facts from the vendored SDK drive the design:
+
+- **Tool name is `_camel_to_snake(ClassName).removesuffix("_tool")`**, and a tool
+  is only usable once the module that calls `register_tool(...)` for it has been
+  imported. The default preset registers `file_editor` / `terminal` /
+  `task_tracker` (importing `openhands.tools.{file_editor,terminal,task_tracker}`);
+  the **legacy** preset (`openhands.tools.preset.legacy`) additionally registers
+  `str_replace_editor` (`StrReplaceEditorTool`) and `execute_bash`
+  (`ExecuteBashTool`). Legacy names do not exist until that module is imported.
+- **Think/Finish are builtins on a different axis.** They are NOT passed in the
+  `tools=` list; they are controlled by `Agent(include_default_tools=[...])` using
+  **class names** `"ThinkTool"` / `"FinishTool"` (SDK default = both; `[]`
+  disables all).
+
+So `build_tools(names)` maps a flat requested list onto the two axes:
+
+| Requested name (config) | Axis | How the driver enables it |
+| --- | --- | --- |
+| `file_editor` | `tools=` | import `openhands.tools.file_editor`; `Tool(name="file_editor")` |
+| `str_replace_editor` | `tools=` | import `openhands.tools.preset.legacy`; `Tool(name="str_replace_editor")` |
+| `terminal` | `tools=` | import `openhands.tools.terminal`; `Tool(name="terminal")` |
+| `execute_bash` | `tools=` | import `openhands.tools.preset.legacy`; `Tool(name="execute_bash")` |
+| `task_tracker` | `tools=` | import `openhands.tools.task_tracker`; `Tool(name="task_tracker")` |
+| `think` / `ThinkTool` | `include_default_tools=` | add `"ThinkTool"` |
+| `finish` / `FinishTool` | `include_default_tools=` | add `"FinishTool"` |
+
+`build_tools` accepts a canonical set of names, imports the registering module
+for each `tools=`-axis entry, routes Think/Finish to `include_default_tools`, and
+raises on an unknown name (fail fast rather than silently drop). Browser tools
+are intentionally not exposed (no outbound internet in the sandbox).
+
+**Config knob:** `SWE_OH_TOOLS` — comma-separated allowlist, forwarded into
+`cfg["tools"]`. **Default:**
+`file_editor,terminal,task_tracker,think,finish` (the default-preset trio plus
+both builtins — matches the benchmark's non-legacy default behavior). A legacy
+run is expressed by setting
+`SWE_OH_TOOLS=str_replace_editor,execute_bash,task_tracker,think,finish` (no
+separate `SWE_OH_LEGACY_TOOLS` flag needed — the tool list *is* the switch).
 
 ---
 
@@ -251,7 +293,7 @@ cloned from the existing 8-node script with these deltas:
 
 - `SWE_AGENT=openhands`.
 - **Add:** `SLIME_AGENT_OH_ENV_TARBALL` (prebuilt editable env), `SWE_OH_FAKE_USER=0`,
-  optional `SWE_OH_MAX_ITERATIONS`, optional `SLIME_AGENT_OH_EXTRA_ENVS`.
+  optional `SWE_OH_MAX_ITERATIONS`, `SWE_OH_TOOLS`, optional `SLIME_AGENT_OH_EXTRA_ENVS`.
 - **Remove:** claude-code knobs (`SLIME_AGENT_CC_TARBALL`, `SLIME_AGENT_CC_EXTRA_ARGS`,
   `AGENTS_JSON`, `SETTINGS_JSON`) and the node tarball (env is self-contained).
 - Keep model-appropriate SGLang parsers
@@ -259,7 +301,7 @@ cloned from the existing 8-node script with these deltas:
   `OpenAIAdapter` reuses them to parse OpenHands' tool calls.
 - Update `RUNTIME_ENV_JSON` key list to propagate the new vars to Ray workers
   (add `SLIME_AGENT_OH_ENV_TARBALL`, `SWE_OH_FAKE_USER`, `SWE_OH_MAX_ITERATIONS`,
-  `SLIME_AGENT_OH_EXTRA_ENVS`; drop the CC keys).
+  `SWE_OH_TOOLS`, `SLIME_AGENT_OH_EXTRA_ENVS`; drop the CC keys).
 
 Everything else (Megatron/GRPO/SGLang args, adapter host wiring,
 `--rollout-max-context-len/response-len`, fan-out semantics) carries over.
@@ -278,7 +320,10 @@ CPU/unit tests as plain scripts calling `pytest.main([__file__])` (per
   right `start_cmd` and routes through `run_agent`.
 - **`oh_driver.py` construction unit** — mock SDK classes; assert `LLM`/`Agent`/
   `Conversation` are built with correct `base_url` / `api_key` / `model`;
-  cover fake-user on/off branches.
+  cover fake-user on/off branches. Include a **`build_tools` unit** (§6.1):
+  default list → `file_editor,terminal,task_tracker` on the `tools=` axis +
+  `ThinkTool,FinishTool` on `include_default_tools`; legacy list → `str_replace_editor,execute_bash`;
+  unknown name → raises; each `tools=` entry imports its registering module.
 - **`tools/repackage_oh_env.py` test** — relink SDK source into an unpacked env
   fixture dir and re-tar (tmp fixtures, no real large artifact).
 - **Reuse unchanged** `tests/test_agent/test_trajectory_manager_branching.py` —
