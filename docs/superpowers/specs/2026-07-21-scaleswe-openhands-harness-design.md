@@ -183,6 +183,68 @@ Methods:
 
 ---
 
+## 5.1 Environment-variable propagation (launch → sandbox → OH driver → agent)
+
+Every knob above, and any user-chosen extra vars, must have an **unbroken path**
+from the RL launch script into the sandbox where `oh_driver.py` (and the agent's
+own tool subprocesses) can read them. The chain has one hand-maintained choke
+point that must be handled explicitly.
+
+**The five hops (verified against the code):**
+
+1. **`run_*.sh` → the Ray job.** The launcher builds `RUNTIME_ENV_JSON` and passes
+   it to `ray job submit --runtime-env-json`. **This is an explicit key
+   allowlist** (a Python snippet copies named keys out of `os.environ`). Any var
+   not named here **never reaches** the `RolloutManager` process. → *This is the
+   gap to close.*
+2. **Ray job → `RolloutManager` process.** `runtime_env.env_vars` become
+   `os.environ` in the single actor process where every `generate()` coroutine
+   runs.
+3. **`RolloutManager` → `sb.exec(env=...)`.** `OpenHandsHarness.launch_and_wait`
+   reads `os.environ`, assembles an `env` dict, and passes it through
+   `run_agent → exec_and_wait → sb.exec(env=env)` (E2B sets `envs=env` on the
+   spawning command).
+4. **`sb.exec` → the detached driver process.** `exec_and_wait` spawns
+   `setsid bash launcher &`; the launcher and the `oh_driver.py` it runs
+   **inherit** that env. (Confirmed: env is set on the `setsid` parent, so the
+   detached child inherits it.)
+5. **driver → agent tool subprocesses.** `oh_driver.py` reads `os.environ`; the
+   OpenHands **Terminal** tool spawns bash from the driver's process env, so
+   forwarded vars also reach commands the agent runs.
+
+**Design — two mechanisms, both first-class:**
+
+- **(a) Close the hop-1 allowlist gap with a pass-through prefix.** In the
+  launcher's `RUNTIME_ENV_JSON` builder, in addition to the explicit named keys,
+  copy **every** `os.environ` var matching a forwarding prefix — canonical
+  `SLIME_AGENT_*` and `SWE_OH_*` (plus the existing `SWE_*` for the task layer).
+  This makes "export it in the launcher with the right prefix → it reaches the
+  RolloutManager" a rule, not a per-var edit. The named-key list stays for
+  cluster/network vars that don't fit a prefix.
+
+- **(b) Explicit extra-vars forwarding into the agent conversation
+  (`SLIME_AGENT_OH_EXTRA_ENVS`).** A JSON object of arbitrary
+  `{"NAME": "value"}` pairs, exported at the launch end, forwarded verbatim by
+  the launcher (hop 1, covered by the `SLIME_AGENT_*` prefix), then merged by
+  `launch_and_wait` into the `env` dict handed to the driver process (hop 3),
+  **last**, so it can override built-in defaults. These land in the driver's
+  `os.environ` and therefore in the agent's Terminal-tool subprocesses (hops
+  4–5). This is the intended way to inject things like proxy settings, tool
+  tokens, `PIP_*`, language/runtime flags, or task-specific vars the repo's
+  tests need — without adding a named knob for each.
+
+  The harness must not silently drop it: on unparseable JSON, fail the rollout
+  with a clear error (mirrors codex's `json.loads(extra_envs)` but with a guard).
+
+**Result:** a var reaches the OH agent by either (a) exporting it under a
+forwarded prefix, or (b) putting it in `SLIME_AGENT_OH_EXTRA_ENVS`. Both paths
+are documented in the launcher and the README, with the hop table above as the
+reference. `oh_config.json` remains the channel for the *structured* knobs the
+driver parses (`adapter_url`, `session_id`, `tools`, `fake_user`, …); raw
+env forwarding (b) is the channel for everything the *agent's shell* should see.
+
+---
+
 ## 6. Component: in-sandbox driver (`examples/coding_agent_rl/oh_driver.py`)
 
 Runs inside the sandbox with `/opt/oh-env/bin/python`; imports the baked SDK.
@@ -299,9 +361,11 @@ cloned from the existing 8-node script with these deltas:
 - Keep model-appropriate SGLang parsers
   (`--sglang-tool-call-parser qwen3_coder --sglang-reasoning-parser qwen3`); the
   `OpenAIAdapter` reuses them to parse OpenHands' tool calls.
-- Update `RUNTIME_ENV_JSON` key list to propagate the new vars to Ray workers
-  (add `SLIME_AGENT_OH_ENV_TARBALL`, `SWE_OH_FAKE_USER`, `SWE_OH_MAX_ITERATIONS`,
-  `SWE_OH_TOOLS`, `SLIME_AGENT_OH_EXTRA_ENVS`; drop the CC keys).
+- Update the `RUNTIME_ENV_JSON` builder to add a **prefix pass-through** (§5.1a):
+  forward every `os.environ` var matching `SLIME_AGENT_*` / `SWE_OH_*` / `SWE_*`,
+  so new knobs need no per-var edit. Keep the explicit named-key list for
+  cluster/network vars; drop the CC keys. `SLIME_AGENT_OH_EXTRA_ENVS` (§5.1b) is
+  carried by the same prefix rule.
 
 Everything else (Megatron/GRPO/SGLang args, adapter host wiring,
 `--rollout-max-context-len/response-len`, fan-out semantics) carries over.
@@ -324,6 +388,11 @@ CPU/unit tests as plain scripts calling `pytest.main([__file__])` (per
   default list → `file_editor,terminal,task_tracker` on the `tools=` axis +
   `ThinkTool,FinishTool` on `include_default_tools`; legacy list → `str_replace_editor,execute_bash`;
   unknown name → raises; each `tools=` entry imports its registering module.
+- **Env-propagation unit (§5.1)** — with a fake `Sandbox` capturing `exec`
+  `env=`, assert `launch_and_wait` forwards `SLIME_AGENT_OH_EXTRA_ENVS` (parsed
+  JSON) into the driver's env dict, merged last (overrides defaults), and raises
+  a clear error on malformed JSON. Assert the config-vs-env split: structured
+  knobs land in `oh_config.json`, raw forwarded vars land in `env=`.
 - **`tools/repackage_oh_env.py` test** — relink SDK source into an unpacked env
   fixture dir and re-tar (tmp fixtures, no real large artifact).
 - **Reuse unchanged** `tests/test_agent/test_trajectory_manager_branching.py` —
