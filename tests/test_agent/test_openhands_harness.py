@@ -90,5 +90,80 @@ def test_write_config_drops_driver_config_and_prompt():
     asyncio.run(run_case())
 
 
+def test_launch_command_and_extra_env_merge():
+    async def run_case():
+        captured = {}
+
+        async def agent(env):
+            captured["env"] = env
+            return 0
+
+        sb = FakeSandbox(on_launch=agent)
+        with patch.object(OpenHandsHarness, "driver_host_path", Path(__file__)):
+            with patch.object(hc.asyncio, "sleep", new=_fast_sleep):
+                rc = await OpenHandsHarness().launch_and_wait(
+                    sb,
+                    _ctx(sid="sess-oh", url="http://host:18001"),
+                    prompt="do it",
+                    time_budget_sec=30,
+                    fake_user=False,
+                    max_iterations=10,
+                    tools=["terminal", "finish"],
+                    extra_envs={"HTTPS_PROXY": "http://p:8080", "HOME": "/override"},
+                )
+        assert rc == 0
+        # the driver is launched with the baked interpreter against the config file
+        body = next(v for k, v in sb.files.items() if k.endswith("run.sh"))
+        assert "/opt/oh-env/bin/python /home/agent/oh_driver.py /home/agent/oh_config.json" in body
+        # extra_envs reach the agent process, merged LAST (override wins)
+        env = captured["env"]
+        assert env["HTTPS_PROXY"] == "http://p:8080"
+        assert env["HOME"] == "/override"
+
+    asyncio.run(run_case())
+
+
+def test_run_wires_steps_in_order():
+    async def run_case():
+        async def agent(_env):
+            return 0
+
+        sb = FakeSandbox(on_launch=agent)
+        with patch.object(OpenHandsHarness, "driver_host_path", Path(__file__)):
+            with patch.object(hc.asyncio, "sleep", new=_fast_sleep):
+                rc = await OpenHandsHarness().run(
+                    sb,
+                    workdir="/workspace/repo",
+                    session_id="sess-run",
+                    adapter_url="http://host:18001",
+                    time_budget_sec=30,
+                    prompt="go",
+                    tools=["terminal", "finish"],
+                )
+        assert rc == 0
+        joined = " ".join(c for c, _ in sb.exec_log)
+        order = [k for k in ("useradd", "oh_config.json", "setsid") if k in joined]
+        assert order == ["useradd", "oh_config.json", "setsid"]
+
+    asyncio.run(run_case())
+
+
+def test_write_config_rejects_non_dict_extra_envs():
+    async def run_case():
+        sb = FakeSandbox()
+        with patch.object(OpenHandsHarness, "driver_host_path", Path(__file__)):
+            try:
+                await OpenHandsHarness().write_config(
+                    sb, _ctx(), prompt="x", fake_user=False,
+                    max_iterations=1, tools=[], extra_envs="NOT_A_DICT",
+                )
+            except TypeError as e:
+                assert "extra_envs must be a dict" in str(e)
+            else:
+                raise AssertionError("expected TypeError for non-dict extra_envs")
+
+    asyncio.run(run_case())
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

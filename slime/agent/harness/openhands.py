@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 from pathlib import Path
 
+from slime.agent import sandbox as _sandbox
 from slime.agent.sandbox import Sandbox, exec_and_wait
 
-from .common import BaseHarness, HarnessContext
+from .common import BaseHarness, HarnessContext, run_agent
 
 _ENV_PREFIX = "/opt/oh-env"
 _PY = f"{_ENV_PREFIX}/bin/python"
@@ -97,6 +99,59 @@ class OpenHandsHarness(BaseHarness):
             timeout=30,
         )
 
-    async def launch_and_wait(self, sb: Sandbox, ctx: HarnessContext, prompt: str, time_budget_sec: int) -> int:
-        # Implemented in Task 2.
-        raise NotImplementedError("OpenHandsHarness.launch_and_wait is added in Task 2")
+    async def launch_and_wait(
+        self,
+        sb: Sandbox,
+        ctx: HarnessContext,
+        prompt: str,
+        time_budget_sec: int,
+        *,
+        fake_user: bool,
+        max_iterations: int,
+        tools: list[str],
+        extra_envs: dict[str, str],
+    ) -> int:
+        await self.write_config(
+            sb,
+            ctx,
+            prompt=prompt,
+            fake_user=fake_user,
+            max_iterations=max_iterations,
+            tools=tools,
+            extra_envs=extra_envs,
+        )
+        start_cmd = f"{_PY} {shlex.quote(self.driver_sandbox_path)} {shlex.quote(self.config_sandbox_path)}"
+        # extra_envs merged LAST so a launcher-supplied value overrides the default.
+        env = {"HOME": "/home/agent", **extra_envs}
+        return await run_agent(
+            sb, workdir=ctx.workdir, start_cmd=start_cmd, env=env, time_budget_sec=time_budget_sec
+        )
+
+    async def run(
+        self,
+        sb: Sandbox,
+        *,
+        workdir: str,
+        session_id: str,
+        adapter_url: str,
+        time_budget_sec: int,
+        prompt: str,
+        fake_user: bool = False,
+        max_iterations: int = 100,
+        tools: list[str] | None = None,
+        extra_envs: dict[str, str] | None = None,
+    ) -> int:
+        """OpenHands variant of BaseHarness.run: same step order (ensure user ->
+        config -> launch), but threads the OpenHands-specific kwargs through."""
+        await _sandbox.ensure_agent_user(sb, workdir)
+        ctx = HarnessContext(workdir=workdir, session_id=session_id, adapter_url=adapter_url)
+        return await self.launch_and_wait(
+            sb,
+            ctx,
+            prompt,
+            time_budget_sec,
+            fake_user=fake_user,
+            max_iterations=max_iterations,
+            tools=list(tools or []),
+            extra_envs=dict(extra_envs or {}),
+        )
