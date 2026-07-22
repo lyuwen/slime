@@ -28,7 +28,7 @@ def relink(env_tar: Path, sdk_src: Path, out_tar: Path, *, prefix_src: str = _DE
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         with tarfile.open(env_tar) as tf:
-            tf.extractall(tmp)
+            tf.extractall(tmp, filter="data")
         dst = tmp / prefix_src
         if dst.exists():
             shutil.rmtree(dst)

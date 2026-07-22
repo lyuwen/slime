@@ -39,7 +39,7 @@ def test_relink_replaces_sdk_source(tmp_path):
 
     extract = tmp_path / "check"
     with tarfile.open(out_tar) as tf:
-        tf.extractall(extract)
+        tf.extractall(extract, filter="data")
     marker = extract / "opt/oh-env/src/software-agent-sdk/openhands-sdk/marker.txt"
     assert marker.read_text() == "NEW"
     # the interpreter (untouched non-src content) survives the repackage
