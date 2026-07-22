@@ -18,6 +18,7 @@ and produces the md dict consumed below.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -31,7 +32,7 @@ from typing import Any
 
 from slime.agent.adapters import AnthropicAdapter, OpenAIAdapter
 from slime.agent.aiohttp_threaded import FilteredAccessLogger, run_app_in_thread
-from slime.agent.harness import ClaudeCodeHarness, CodexHarness
+from slime.agent.harness import ClaudeCodeHarness, CodexHarness, OpenHandsHarness
 from slime.agent.sandbox import E2BSandbox
 from slime.utils.misc import SingletonMeta
 from slime.utils.processing_utils import load_tokenizer
@@ -45,6 +46,7 @@ logging.getLogger("e2b").setLevel(logging.WARNING)
 _AGENTS = {
     "claude_code": (ClaudeCodeHarness, AnthropicAdapter),
     "codex": (CodexHarness, OpenAIAdapter),
+    "openhands": (OpenHandsHarness, OpenAIAdapter),
 }
 AGENT_NAME = os.environ.get("SWE_AGENT", "claude_code")
 if AGENT_NAME not in _AGENTS:
@@ -65,6 +67,10 @@ class SweConfig:
     rollout_guard_sec: int
     boot_concurrency: int
     boot_retries: int
+    oh_fake_user: bool
+    oh_max_iterations: int
+    oh_tools: list[str]
+    oh_extra_envs: dict[str, str]
 
     @classmethod
     def from_env(cls) -> SweConfig:
@@ -72,6 +78,12 @@ class SweConfig:
         eval_timeout = int(os.environ.get("SWE_EVAL_TIMEOUT_SEC", "600"))
         guard = int(os.environ.get("SWE_ROLLOUT_GUARD_SEC", "0") or 0) or (agent_time_budget + eval_timeout + 180)
         fork = int(v) if (v := os.environ.get("SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS")) else None
+        oh_tools_raw = os.environ.get("SWE_OH_TOOLS", "file_editor,terminal,task_tracker,think,finish")
+        oh_tools = [t.strip() for t in oh_tools_raw.split(",") if t.strip()]
+        oh_extra_envs_raw = os.environ.get("SLIME_AGENT_OH_EXTRA_ENVS", "").strip()
+        oh_extra_envs = json.loads(oh_extra_envs_raw) if oh_extra_envs_raw else {}
+        if not isinstance(oh_extra_envs, dict):
+            raise ValueError("SLIME_AGENT_OH_EXTRA_ENVS must be a JSON object")
         return cls(
             eval_protocol=os.environ.get("SWE_EVAL_PROTOCOL", swe.PROTOCOL_SCALESWE),
             train_protocol=os.environ.get("SWE_TRAIN_PROTOCOL", swe.PROTOCOL_SCALESWE),
@@ -84,6 +96,10 @@ class SweConfig:
             rollout_guard_sec=guard,
             boot_concurrency=int(os.environ.get("SWE_BOOT_CONCURRENCY", "16")),
             boot_retries=int(os.environ.get("SWE_BOOT_RETRIES", "2")),
+            oh_fake_user=os.environ.get("SWE_OH_FAKE_USER", "0") not in ("0", "", "false", "False"),
+            oh_max_iterations=int(os.environ.get("SWE_OH_MAX_ITERATIONS", "100")),
+            oh_tools=oh_tools,
+            oh_extra_envs=oh_extra_envs,
         )
 
 
@@ -202,6 +218,16 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         async with asyncio.timeout(CONFIG.rollout_guard_sec):
             async with boot_agent_sandbox(md["image"], instance_id) as sb:
                 await swe.prepare_workspace(sb, md["workdir"], md)
+                oh_kwargs = (
+                    {
+                        "fake_user": CONFIG.oh_fake_user,
+                        "max_iterations": CONFIG.oh_max_iterations,
+                        "tools": CONFIG.oh_tools,
+                        "extra_envs": CONFIG.oh_extra_envs,
+                    }
+                    if AGENT_NAME == "openhands"
+                    else {}
+                )
                 agent_exit_code = await HARNESS_CLS().run(
                     sb,
                     workdir=md["workdir"],
@@ -209,6 +235,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     adapter_url=state.adapter_url,
                     time_budget_sec=CONFIG.agent_time_budget_sec,
                     prompt=swe.SWE_PROMPT,
+                    **oh_kwargs,
                 )
                 diff_text = await swe.git_diff(sb, md["workdir"])
 

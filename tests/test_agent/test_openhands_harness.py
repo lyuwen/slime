@@ -165,5 +165,19 @@ def test_write_config_rejects_non_dict_extra_envs():
     asyncio.run(run_case())
 
 
+def test_sweconfig_parses_openhands_knobs(monkeypatch):
+    monkeypatch.setenv("SWE_OH_FAKE_USER", "1")
+    monkeypatch.setenv("SWE_OH_MAX_ITERATIONS", "55")
+    monkeypatch.setenv("SWE_OH_TOOLS", "terminal, finish")
+    monkeypatch.setenv("SLIME_AGENT_OH_EXTRA_ENVS", '{"HTTPS_PROXY": "http://p:8080"}')
+    from examples.coding_agent_rl.generate import SweConfig
+
+    cfg = SweConfig.from_env()
+    assert cfg.oh_fake_user is True
+    assert cfg.oh_max_iterations == 55
+    assert cfg.oh_tools == ["terminal", "finish"]
+    assert cfg.oh_extra_envs == {"HTTPS_PROXY": "http://p:8080"}
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
