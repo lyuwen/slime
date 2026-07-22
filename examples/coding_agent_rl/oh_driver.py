@@ -14,6 +14,9 @@ SDK is absent. All openhands imports happen lazily inside functions.
 
 from __future__ import annotations
 
+import json
+import sys
+
 # Tool name -> the import path of the module whose import calls register_tool for
 # it. Default preset: file_editor/terminal/task_tracker. Legacy preset also
 # registers str_replace_editor/execute_bash (only after that module is imported).
@@ -72,3 +75,62 @@ def build_tools(names, *, register_module=None, make_tool=None):
                 f"known: {sorted(set(_TOOLS_AXIS_MODULES) | set(_BUILTIN_AXIS))}"
             )
     return tools, include_default
+
+
+def _run_with_fake_user(conv, max_nudges: int = 100) -> None:
+    """Minimal fake-user nudge loop (vendored, ~self-contained).
+
+    OpenHands stops the run when the agent sends a plain message instead of using
+    a tool. In eval/RL we want it to keep going until it calls the finish tool.
+    After each run() returns without finishing, send a short nudge and run again,
+    bounded by max_nudges.
+    """
+    from openhands.sdk.conversation.state import ConversationExecutionStatus
+
+    nudge = (
+        "Please continue working on the task with whatever approach you think is "
+        "suitable. When you are done, call the finish tool."
+    )
+    for _ in range(max_nudges):
+        conv.run()
+        if conv.state.execution_status == ConversationExecutionStatus.FINISHED:
+            return
+        conv.send_message(nudge)
+
+
+def main(config_path: str) -> int:
+    from openhands.sdk import LLM, Agent, Conversation
+    from openhands.sdk.workspace import LocalWorkspace
+
+    with open(config_path) as f:
+        cfg = json.load(f)
+    with open("/home/agent/oh_prompt.txt") as f:
+        prompt = f.read()
+
+    tools, include_default = build_tools(cfg["tools"])
+    llm = LLM(
+        model="openai/" + cfg.get("model_label", "slime-actor"),
+        base_url=cfg["adapter_url"] + "/v1",
+        api_key=cfg["session_id"],
+    )
+    agent = Agent(
+        llm=llm,
+        tools=tools,
+        include_default_tools=include_default,
+        system_prompt_kwargs={"cli_mode": True},
+    )
+    conv = Conversation(
+        agent=agent,
+        workspace=LocalWorkspace(working_dir=cfg["workdir"]),
+        max_iteration_per_run=int(cfg["max_iterations"]),
+    )
+    conv.send_message(prompt)
+    if cfg.get("fake_user"):
+        _run_with_fake_user(conv)
+    else:
+        conv.run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1]))
