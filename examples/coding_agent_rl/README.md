@@ -139,6 +139,58 @@ The Anthropic adapter reuses `--sglang-tool-call-parser` and
 `--sglang-reasoning-parser` for output parsing, so those flags must match the
 served model.
 
+## OpenHands SDK Harness (`SWE_AGENT=openhands`)
+
+Selects `(OpenHandsHarness, OpenAIAdapter)`. Unlike claude-code/codex (self-contained
+CLIs), OpenHands is a Python agent loop that runs *inside* the sandbox with a
+`LocalWorkspace`; its litellm traffic dials back to the same `OpenAIAdapter` used
+by codex, so token capture and trajectory handling are unchanged.
+
+### The environment tarball (`SLIME_AGENT_OH_ENV_TARBALL`)
+
+OpenHands needs Python 3.12 and a dep tree too heavy to `pip install` per boot.
+Build a self-contained env **once** on the host and ship it as a tarball that
+unpacks with a single `tar x` (no node/npm/pip/egress at boot):
+
+1. Materialize a python-build-standalone CPython 3.12 at the fixed prefix `/opt/oh-env`.
+2. Place the 4 OpenHands packages under `/opt/oh-env/src/software-agent-sdk/`.
+3. `/opt/oh-env/bin/pip install -e` those packages (editable — records the path),
+   then install all deps.
+4. `tar cf oh-env.tar -C / opt/oh-env` (must unpack back to `/opt/oh-env`).
+
+Boot-time `install_cli` runs `tar xf /tmp/oh-env.tar -C /` and verifies
+`import openhands.sdk, openhands.tools`.
+
+Swap fresh SDK source without rebuilding the venv:
+
+    python tools/repackage_oh_env.py \
+      --env-tarball oh-env.tar \
+      --sdk-src thirdparty/benchmarks-main/vendor/software-agent-sdk \
+      --out oh-env.relinked.tar
+
+### Tool allowlist (`SWE_OH_TOOLS`)
+
+Comma-separated; default `file_editor,terminal,task_tracker,think,finish`. Legacy
+tool set: `SWE_OH_TOOLS=str_replace_editor,execute_bash,task_tracker,think,finish`.
+`think`/`finish` are builtins (routed to `Agent(include_default_tools=...)`); the
+rest are `Agent(tools=...)` entries whose registering module is imported first.
+
+### Forwarding env vars into the agent
+
+Two mechanisms carry launch-side vars all the way into the OH agent's shell:
+1. **Prefix pass-through** — any `SLIME_AGENT_*` / `SWE_OH_*` / `SWE_*` var exported
+   in the launcher is auto-forwarded through `RUNTIME_ENV_JSON` to the RolloutManager
+   process (no per-var edit).
+2. **`SLIME_AGENT_OH_EXTRA_ENVS`** — a JSON object of arbitrary `{"NAME":"value"}`
+   pairs merged (last) into the driver's process env, so proxies/tokens/`PIP_*`/etc.
+   reach the agent's Terminal-tool subprocesses.
+
+Path: launcher → `RUNTIME_ENV_JSON` → RolloutManager `os.environ` → harness
+`sb.exec(env=...)` → detached driver process → agent tool subprocesses.
+
+Eval/reward is unchanged (reuses `swe.py`'s scaleswe grader). The docker/k8s
+runtime-service sandbox backend is a separate follow-up; this path runs on `E2BSandbox`.
+
 ## String-in, Token-out Trajectories
 
 The coding-agent environment is string/message based: claude-code sends
