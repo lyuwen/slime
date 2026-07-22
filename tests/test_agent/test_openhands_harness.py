@@ -21,8 +21,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from tests.test_agent._fakes import FakeSandbox  # noqa: E402
 
-from slime.agent.harness import OpenHandsHarness  # noqa: E402
 from slime.agent.harness import HarnessContext  # noqa: E402
+from slime.agent.harness import OpenHandsHarness  # noqa: E402
 from slime.agent.harness import common as hc  # noqa: E402
 
 _REAL_SLEEP = asyncio.sleep
@@ -63,9 +63,7 @@ def test_install_cli_untars_env_and_verifies_import():
 def test_write_config_drops_driver_config_and_prompt():
     async def run_case():
         sb = FakeSandbox()
-        with patch.object(
-            OpenHandsHarness, "driver_host_path", Path(__file__)  # any real file to stream in
-        ):
+        with patch.object(OpenHandsHarness, "driver_host_path", Path(__file__)):  # any real file to stream in
             await OpenHandsHarness().write_config(
                 sb,
                 _ctx(sid="sess-oh", url="http://host:18001"),
@@ -154,8 +152,13 @@ def test_write_config_rejects_non_dict_extra_envs():
         with patch.object(OpenHandsHarness, "driver_host_path", Path(__file__)):
             try:
                 await OpenHandsHarness().write_config(
-                    sb, _ctx(), prompt="x", fake_user=False,
-                    max_iterations=1, tools=[], extra_envs="NOT_A_DICT",
+                    sb,
+                    _ctx(),
+                    prompt="x",
+                    fake_user=False,
+                    max_iterations=1,
+                    tools=[],
+                    extra_envs="NOT_A_DICT",
                 )
             except TypeError as e:
                 assert "extra_envs must be a dict" in str(e)

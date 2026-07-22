@@ -48,10 +48,7 @@ class OpenHandsHarness(BaseHarness):
         await sb.write_file("/tmp/oh-env.tar", tarball)
         exit_code, log = await exec_and_wait(
             sb,
-            cmd=(
-                f"tar xf /tmp/oh-env.tar -C / && "
-                f"{_PY} -c 'import openhands.sdk; import openhands.tools'"
-            ),
+            cmd=(f"tar xf /tmp/oh-env.tar -C / && " f"{_PY} -c 'import openhands.sdk; import openhands.tools'"),
             user="root",
             time_budget_sec=300,
             tag="oh-install",
@@ -92,8 +89,7 @@ class OpenHandsHarness(BaseHarness):
         }
         await sb.write_file(self.config_sandbox_path, json.dumps(config), user="agent")
         await sb.exec(
-            f"chown agent:agent {self.driver_sandbox_path} "
-            f"{self.config_sandbox_path} {self.prompt_sandbox_path}",
+            f"chown agent:agent {self.driver_sandbox_path} " f"{self.config_sandbox_path} {self.prompt_sandbox_path}",
             user="root",
             check=True,
             timeout=30,
@@ -123,9 +119,7 @@ class OpenHandsHarness(BaseHarness):
         start_cmd = f"{_PY} {shlex.quote(self.driver_sandbox_path)} {shlex.quote(self.config_sandbox_path)}"
         # extra_envs merged LAST so a launcher-supplied value overrides the default.
         env = {"HOME": "/home/agent", **extra_envs}
-        return await run_agent(
-            sb, workdir=ctx.workdir, start_cmd=start_cmd, env=env, time_budget_sec=time_budget_sec
-        )
+        return await run_agent(sb, workdir=ctx.workdir, start_cmd=start_cmd, env=env, time_budget_sec=time_budget_sec)
 
     async def run(
         self,
