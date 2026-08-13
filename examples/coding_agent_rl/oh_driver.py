@@ -77,13 +77,40 @@ def build_tools(names, *, register_module=None, make_tool=None):
     return tools, include_default
 
 
+def _last_agent_outcome(conv) -> str:
+    """Classify why conv.run() returned, from the tail of the event log.
+
+    Status alone is ambiguous: the SDK reports FINISHED both when the agent
+    calls the finish tool AND when it stops by sending a plain message. Only the
+    latter is worth a fake-user nudge, so we walk back to the last agent turn:
+
+    - "finished": last agent action was the finish tool -> genuinely done.
+    - "plain_response": agent sent prose instead of a tool call -> nudge-eligible.
+    - "other": last agent turn was some other tool call, or there is no agent
+      turn to nudge -> treat as terminal.
+    """
+    from openhands.sdk.event import ActionEvent, MessageEvent
+    from openhands.sdk.tool.builtins.finish import FinishAction
+
+    for event in reversed(list(conv.state.events)):
+        if isinstance(event, ActionEvent):
+            return "finished" if isinstance(getattr(event, "action", None), FinishAction) else "other"
+        if isinstance(event, MessageEvent):
+            source = getattr(event, "source", None)
+            if getattr(source, "value", source) == "agent":
+                return "plain_response"
+    return "other"
+
+
 def _run_with_fake_user(conv, max_nudges: int = 100) -> None:
-    """Minimal fake-user nudge loop (vendored, ~self-contained).
+    """Fake-user nudge loop.
 
     OpenHands stops the run when the agent sends a plain message instead of using
-    a tool. In eval/RL we want it to keep going until it calls the finish tool.
-    After each run() returns without finishing, send a short nudge and run again,
-    bounded by max_nudges.
+    a tool. In eval/RL we want it to keep going until it calls the finish tool,
+    so on that (and only that) case we send a short nudge and run again, bounded
+    by max_nudges. Every other terminal state -- finish tool, ERROR, STUCK,
+    max-iterations -- is left alone; nudging a dead conversation would just burn
+    turns and hammer the adapter.
     """
     from openhands.sdk.conversation.state import ConversationExecutionStatus
 
@@ -93,7 +120,11 @@ def _run_with_fake_user(conv, max_nudges: int = 100) -> None:
     )
     for _ in range(max_nudges):
         conv.run()
-        if conv.state.execution_status == ConversationExecutionStatus.FINISHED:
+        # ERROR / STUCK / max-iterations report a non-FINISHED status: terminal.
+        if conv.state.execution_status != ConversationExecutionStatus.FINISHED:
+            return
+        # FINISHED is ambiguous; only a plain agent message is nudge-eligible.
+        if _last_agent_outcome(conv) != "plain_response":
             return
         conv.send_message(nudge)
 
@@ -104,15 +135,29 @@ def main(config_path: str) -> int:
 
     with open(config_path) as f:
         cfg = json.load(f)
-    with open("/home/agent/oh_prompt.txt") as f:
+
+    # prompt_path defaults to the in-sandbox convention; override via config for
+    # local (non-sandbox) runs.
+    prompt_path = cfg.get("prompt_path", "/home/agent/oh_prompt.txt")
+    with open(prompt_path) as f:
         prompt = f.read()
 
     tools, include_default = build_tools(cfg["tools"])
-    llm = LLM(
-        model="openai/" + cfg.get("model_label", "slime-actor"),
-        base_url=cfg["adapter_url"] + "/v1",
-        api_key=cfg["session_id"],
-    )
+
+    # Two LLM construction paths:
+    #  "llm" key present  → rich config dict, already resolved by the caller
+    #                        (see OmegaConf.to_container + LLM.model_validate_json
+    #                        in benchmarks/scaleswe/run_infer.py for the pattern).
+    #  fallback           → slime-adapter triple (adapter_url / session_id /
+    #                        model_label), the original in-sandbox path.
+    if "llm" in cfg:
+        llm = LLM.model_validate_json(json.dumps(cfg["llm"]))
+    else:
+        llm = LLM(
+            model="openai/" + cfg.get("model_label", "slime-actor"),
+            base_url=cfg["adapter_url"] + "/v1",
+            api_key=cfg["session_id"],
+        )
     agent = Agent(
         llm=llm,
         tools=tools,
