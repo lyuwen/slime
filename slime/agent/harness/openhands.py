@@ -1,27 +1,29 @@
 """OpenHands software-agent-sdk harness.
 
 Unlike the CLI harnesses (claude_code / codex), OpenHands is a Python agent loop.
-This harness unpacks a prebuilt, self-contained Python-3.12 venv (with the
-OpenHands SDK editable-installed) into the sandbox at the fixed prefix
-``/opt/oh-env``, drops a small in-sandbox driver (``oh_driver.py``) plus its
-JSON config and the task prompt, then runs the driver detached via the shared
-``run_agent`` transport. The driver's litellm traffic dials back to slime's
-OpenAIAdapter, so token capture is identical to the codex path.
+This harness expects a prebuilt, self-contained Python-3.12 venv (with the
+OpenHands SDK editable-installed) already present in the sandbox at the fixed
+prefix ``/opt/oh-env``, drops a small in-sandbox driver (``oh_driver.py``) plus
+its JSON config and the task prompt, then runs the driver detached via the
+shared ``run_agent`` transport. The driver's litellm traffic dials back to
+slime's OpenAIAdapter, so token capture is identical to the codex path.
 
-Env delivery is a single prebuilt tarball (SLIME_AGENT_OH_ENV_TARBALL); boot is
-pure ``tar x`` -- no node, npm, pip, or network egress. The tarball MUST unpack
-to ``/opt/oh-env`` (editable-install paths depend on the fixed prefix).
+Env delivery is an image volume: the oh-env layer (built by
+``tools/oh-env-image.Dockerfile``) is mounted at ``/opt/oh-env`` when the
+sandbox image is provisioned, so boot needs no tarball upload, tar, node, npm,
+pip, or network egress -- the harness only verifies the prefix is present. The
+mount MUST land at ``/opt/oh-env`` (editable-install paths depend on the fixed
+prefix).
 """
 
 from __future__ import annotations
 
 import json
-import os
 import shlex
 from pathlib import Path
 
 from slime.agent import sandbox as _sandbox
-from slime.agent.sandbox import Sandbox, exec_and_wait
+from slime.agent.sandbox import Sandbox
 
 from .common import BaseHarness, HarnessContext, run_agent
 
@@ -33,7 +35,6 @@ class OpenHandsHarness(BaseHarness):
     name = "openhands"
 
     # host paths + knobs, all under the agent-layer SLIME_AGENT_* prefix
-    env_tarball_env = "SLIME_AGENT_OH_ENV_TARBALL"
     extra_envs_env = "SLIME_AGENT_OH_EXTRA_ENVS"
 
     env_prefix = _ENV_PREFIX
@@ -43,18 +44,24 @@ class OpenHandsHarness(BaseHarness):
     prompt_sandbox_path = "/home/agent/oh_prompt.txt"
 
     async def install_cli(self, sb: Sandbox) -> None:
-        """Untar the prebuilt env to the fixed prefix and verify the SDK imports."""
-        tarball = Path(os.environ[self.env_tarball_env])
-        await sb.write_file("/tmp/oh-env.tar", tarball)
-        exit_code, log = await exec_and_wait(
-            sb,
-            cmd=(f"tar xf /tmp/oh-env.tar -C / && " f"{_PY} -c 'import openhands.sdk; import openhands.tools'"),
+        """Verify the oh-env image volume is mounted at the fixed prefix.
+
+        The env is delivered as an image volume (see the module docstring), not
+        unpacked at boot, so there is nothing to install -- we only fail fast if
+        ``/opt/oh-env`` is missing, which means the sandbox image was provisioned
+        without the oh-env layer mounted."""
+        exit_code, out, err = await sb.exec(
+            f"test -x {_PY}",
             user="root",
-            time_budget_sec=300,
-            tag="oh-install",
+            timeout=15,
+            check=False,
         )
         if exit_code != 0:
-            raise RuntimeError(f"OpenHands env install failed (exit={exit_code}):\n{log[-1000:]}")
+            raise RuntimeError(
+                f"{_PY} not found in the sandbox. The oh-env image volume "
+                f"(tools/oh-env-image.Dockerfile) must be mounted at {_ENV_PREFIX}; "
+                f"check the sandbox template/image provisioning."
+            )
 
     async def write_config(
         self,
@@ -137,6 +144,7 @@ class OpenHandsHarness(BaseHarness):
     ) -> int:
         """OpenHands variant of BaseHarness.run: same step order (ensure user ->
         config -> launch), but threads the OpenHands-specific kwargs through."""
+        await self.install_cli(sb)
         await _sandbox.ensure_agent_user(sb, workdir)
         ctx = HarnessContext(workdir=workdir, session_id=session_id, adapter_url=adapter_url)
         return await self.launch_and_wait(

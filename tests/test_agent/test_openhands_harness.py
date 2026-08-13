@@ -36,26 +36,25 @@ def _ctx(workdir="/workspace/repo", sid="sess-1", url="http://host:18001") -> Ha
     return HarnessContext(workdir=workdir, session_id=sid, adapter_url=url)
 
 
-def test_install_cli_untars_env_and_verifies_import():
+def test_install_cli_verifies_prefix_present():
     async def run_case():
-        # install_cli uses exec_and_wait (detached setsid + done-marker poll), so
-        # the fake must drive the launch handshake: on_launch returns exit 0 so
-        # the marker is written and the poll succeeds on the next tick.
-        async def installer(_env):
-            return 0
+        # Env is delivered as an image volume mounted at /opt/oh-env, so
+        # install_cli only probes that the baked interpreter is present.
+        # FakeSandbox.exec defaults to exit 0, so the probe passes.
+        sb = FakeSandbox()
+        await OpenHandsHarness().install_cli(sb)
+        probe = next(c for c, _ in sb.exec_log if "test -x" in c)
+        assert "/opt/oh-env/bin/python" in probe
 
-        sb = FakeSandbox(on_launch=installer)
-        with patch.dict("os.environ", {"SLIME_AGENT_OH_ENV_TARBALL": "/host/oh-env.tar"}):
-            with patch.object(hc.asyncio, "sleep", new=_fast_sleep):
-                await OpenHandsHarness().install_cli(sb)
-        # the env tarball is streamed in, then untarred + import-checked in the
-        # detached launcher body (exec_and_wait writes it to /tmp/.oh-install.sh)
-        assert "/tmp/oh-env.tar" in sb.files
-        body = " ".join(str(v) for v in sb.files.values())
-        assert "tar xf /tmp/oh-env.tar -C /" in body
-        # import self-check uses the baked interpreter
-        assert "/opt/oh-env/bin/python" in body
-        assert "import openhands.sdk" in body and "import openhands.tools" in body
+    asyncio.run(run_case())
+
+
+def test_install_cli_raises_when_prefix_missing():
+    async def run_case():
+        # A non-zero probe means the oh-env layer was not mounted: fail fast.
+        sb = FakeSandbox(responses=[("test -x", (1, "", ""))])
+        with pytest.raises(RuntimeError, match="oh-env image volume"):
+            await OpenHandsHarness().install_cli(sb)
 
     asyncio.run(run_case())
 

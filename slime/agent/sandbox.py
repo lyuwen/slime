@@ -19,10 +19,24 @@ from typing import Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
-from .patch_e2b import patch_e2b
+_e2b_patched = False
 
-patch_e2b(https=False, validate_key=False)
-logger.info("E2B sandbox patched")
+
+def _ensure_e2b_patched() -> None:
+    """Apply the kruise e2b patch once, lazily.
+
+    ``patch_e2b`` imports ``e2b`` at import time, so it must not run at module
+    load: the CPU test suite imports this module without e2b installed. Deferring
+    to the first sandbox creation keeps the import edge inside the e2b-only path.
+    """
+    global _e2b_patched
+    if _e2b_patched:
+        return
+    from .patch_e2b import patch_e2b
+
+    patch_e2b(https=False, validate_key=False)
+    _e2b_patched = True
+    logger.info("E2B sandbox patched")
 
 
 ExecResult = tuple[int, str, str]
@@ -286,6 +300,8 @@ class E2BSandbox:
                 "The legacy SWE_SANDBOX_IMAGE_METADATA_KEY name is also "
                 "accepted for coding-agent examples."
             )
+        _ensure_e2b_patched()
+
         from e2b import AsyncSandbox  # type: ignore
 
         md = {
