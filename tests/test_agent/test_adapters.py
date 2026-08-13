@@ -461,5 +461,39 @@ def test_parse_xml_tool_uses_ignores_unknown_tool():
     assert "<tool_call>" in cleaned  # left untouched
 
 
+# ---------------------------------------------------------------------------
+# sampling-param precedence
+# ---------------------------------------------------------------------------
+
+
+class _FakeSession:
+    def __init__(self, sampling_defaults: dict) -> None:
+        self.sampling_defaults = sampling_defaults
+        self.max_context_tokens = 0
+
+
+def _sp(defaults: dict, body: dict) -> dict:
+    from slime.agent.adapters.common import _sampling_params
+
+    return _sampling_params(_FakeSession(defaults), body, max_token_keys=("max_tokens",), stop_keys=("stop",))
+
+
+def test_sampling_defaults_win_over_agent_body():
+    # The rollout manager's temperature/top_p are authoritative even when the
+    # agent (e.g. OpenHands' LLM) forces its own values into the request body.
+    sp = _sp({"temperature": 0.8, "top_p": 0.95}, {"temperature": 0.0, "top_p": 1.0})
+    assert sp["temperature"] == 0.8
+    assert sp["top_p"] == 0.95
+
+
+def test_body_sampling_applies_when_default_unset():
+    # Keys the manager did not set still fall back to the body (CLI harnesses
+    # send none of these, so their behavior is unchanged).
+    sp = _sp({"temperature": 0.8}, {"temperature": 0.0, "top_p": 0.5, "top_k": 20})
+    assert sp["temperature"] == 0.8  # default wins
+    assert sp["top_p"] == 0.5  # body fills the gap
+    assert sp["top_k"] == 20
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

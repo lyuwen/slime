@@ -414,12 +414,13 @@ def sid_from_body(body: dict | None) -> str | None:
 
 
 def _sampling_params(session: Any, body: dict, *, max_token_keys: tuple[str, ...], stop_keys: tuple[str, ...]) -> dict:
+    defaults = session.sampling_defaults or {}
     sp: dict[str, Any] = {
         "skip_special_tokens": False,
         "spaces_between_special_tokens": False,
         "no_stop_trim": True,
         "max_new_tokens": 4096,
-        **(session.sampling_defaults or {}),
+        **defaults,
     }
 
     for key in max_token_keys:
@@ -427,8 +428,14 @@ def _sampling_params(session: Any, body: dict, *, max_token_keys: tuple[str, ...
             sp["max_new_tokens"] = min(int(sp.get("max_new_tokens", body[key])), int(body[key]))
             break
 
+    # The rollout manager's sampling defaults are authoritative for on-policy RL:
+    # a key it set wins over whatever the agent sends. This matters because some
+    # agent SDKs (e.g. OpenHands' LLM) force temperature/top_p into every request
+    # body and cannot be told to omit them, which would otherwise silently
+    # override the configured rollout distribution. Body values still apply for
+    # keys the manager left unset (the CLI harnesses send none of these).
     for src_k, dst_k in (("temperature", "temperature"), ("top_p", "top_p"), ("top_k", "top_k")):
-        if src_k in body:
+        if src_k in body and dst_k not in defaults:
             sp[dst_k] = body[src_k]
 
     for key in stop_keys:
