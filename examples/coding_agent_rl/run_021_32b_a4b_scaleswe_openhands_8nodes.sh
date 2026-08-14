@@ -1,26 +1,27 @@
 #!/usr/bin/env bash
-# End-to-end SWE coding-agent RL on 8 nodes. See README.md for the dataset
-# schema, env vars, and fan-out semantics. Run from a long-lived shell / tmux
-# session on the Ray head node (a short-lived nohup launcher gets its Ray child
-# processes cleaned up with it).
-
-# Best-effort cleanup so a rerun does not collide with stale workers.
-pkill -9 sglang || true
-sleep 3
-ray stop --force || true
-pkill -9 ray || true
-sleep 3
-pkill -9 ray || true
+# End-to-end SWE coding-agent RL on 8 nodes with DeepSeek-V3-0321 32B-A4B,
+# EXTERNAL-CLUSTER variant. Adapted from
+# run_qwen36_35b_a3b_scaleswe_openhands_8nodes-extcluster.sh.
+#
+# Does NOT start/stop Ray or SSH into workers: the Ray cluster is assumed to be
+# already up (head + workers joined), and we only submit the job to it. Point
+# RAY_API_SERVER_ADDRESS at the running head's dashboard (default
+# http://127.0.0.1:8265). See README.md for the dataset schema and env vars.
 
 set -ex
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 SLIME_DIR="${SLIME_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 
+# Source model architecture (40 layers, MLA, 80 experts, topk 7, softmax routing).
+source "${SLIME_DIR}/scripts/models/021-32B-A4B.sh"
+
 # ============ model parallelism ============
-export TP_SIZE="${TP_SIZE:-2}"
-export PP_SIZE="${PP_SIZE:-1}"
-export CP_SIZE="${CP_SIZE:-8}"
+# 8-node, 64-GPU run. PP=8 / EP=8 matches run_8xH20.sh 32B section.
+# No CP: MLA + context-parallel interaction needs verification; disable for safety.
+export TP_SIZE="${TP_SIZE:-1}"
+export PP_SIZE="${PP_SIZE:-8}"
+export CP_SIZE="${CP_SIZE:-1}"
 export EP_SIZE="${EP_SIZE:-8}"
 export ETP_SIZE="${ETP_SIZE:-1}"
 
@@ -30,27 +31,13 @@ ROLLOUT_DP_SIZE="${ROLLOUT_DP_SIZE:-8}"
 ROLLOUT_EP_SIZE="${ROLLOUT_EP_SIZE:-8}"
 ROLLOUT_MEM_UTILIZATION="${ROLLOUT_MEM_UTILIZATION:-0.75}"
 
-# ============ Qwen3.5-35B-A3B architecture ============
-NLAYERS=40
-FIRST_K_DENSE_REPLACE=0
-
-arr=()
-for ((i=0; i<NLAYERS; i++)); do
-  if (( i < FIRST_K_DENSE_REPLACE )); then
-    arr+=(0)
-  else
-    arr+=(1)
-  fi
-done
-printf -v MOE_LAYER_FREQ "[%s]" "$(IFS=', '; echo "${arr[*]}")"
-
 # ============ context length ============
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-96000}"
 MAX_GEN_LEN="${MAX_GEN_LEN:-32768}"
 
 # ============ paths — override before launching ============
-HF_CHECKPOINT="${HF_CHECKPOINT:-/path/to/Qwen3.6-35B-A3B}"
-REF_MODEL_PATH="${REF_MODEL_PATH:-/path/to/Qwen3.6-35B-A3B_torch_dist}"
+HF_CHECKPOINT="${HF_CHECKPOINT:-/path/to/DeepSeek-V3-0321}"
+REF_MODEL_PATH="${REF_MODEL_PATH:-/path/to/DeepSeek-V3-0321_torch_dist}"
 PROMPT_DATA="${PROMPT_DATA:-/path/to/swe_train.jsonl}"
 
 EXP_TAG="${EXP_TAG:-agent_only}"
@@ -66,49 +53,7 @@ echo "Training log: ${LOG_FILE}"
 echo "RUN_ROOT=${RUN_ROOT}"
 echo "======================================================================"
 
-MODEL_ARGS=(
-   --spec "slime_plugins.models.qwen3_5" "get_qwen3_5_spec"
-
-   --disable-bias-linear
-   --qk-layernorm
-   --group-query-attention
-   --num-attention-heads 16
-   --num-query-groups 2
-   --kv-channels 256
-   --num-layers 40
-   --hidden-size 2048
-   --ffn-hidden-size 512
-   --use-gated-attention
-
-   --normalization RMSNorm
-   --apply-layernorm-1p
-   --position-embedding-type rope
-   --norm-epsilon 1e-6
-   --rotary-percent 0.25
-   --swiglu
-   --untie-embeddings-and-output-weights
-   --vocab-size 248320
-
-   --rotary-base 10000000
-
-   # moe
-   --moe-ffn-hidden-size 512
-   --moe-shared-expert-intermediate-size 512
-   --moe-router-score-function softmax
-   --moe-token-dispatcher-type alltoall
-   --moe-router-topk 8
-   --moe-layer-freq "$MOE_LAYER_FREQ"
-   --num-experts 256
-   --moe-grouped-gemm
-   --moe-token-drop-policy probs
-   --moe-router-dtype fp32
-   --moe-permute-fusion
-   --moe-aux-loss-coeff 0
-
-   # qwen3.5 specific
-   --attention-output-gate
-   --moe-shared-expert-gate
-)
+# MODEL_ARGS already populated by the sourced model script above.
 
 CKPT_ARGS=(
    --hf-checkpoint "${HF_CHECKPOINT}"
@@ -127,7 +72,11 @@ ROLLOUT_ARGS=(
    --rollout-max-context-len ${MAX_CONTEXT_LEN}
    --rollout-max-response-len ${MAX_GEN_LEN}
    --rollout-temperature 1.0
-   --rollout-stop-token-ids 248046 248044
+   # DeepSeek-V3-0321 32B-A4B tiktoken vocab (128256). The chat template ends
+   # every assistant turn with <|im_end|> and tokenizer_config sets
+   # eos_token=<|im_end|>=128012, so that is the turn terminator (NOT
+   # <|end_of_text|>=128001). Adjust if your checkpoint uses a different tokenizer.
+   --rollout-stop-token-ids 128012
    --num-steps-per-rollout 1
    --global-batch-size 64
    --micro-batch-size 1
@@ -136,16 +85,14 @@ ROLLOUT_ARGS=(
 
 PERF_ARGS=(
    --tensor-model-parallel-size ${TP_SIZE}
-   --sequence-parallel
    --pipeline-model-parallel-size ${PP_SIZE}
    --context-parallel-size ${CP_SIZE}
    --expert-model-parallel-size ${EP_SIZE}
    --expert-tensor-parallel-size ${ETP_SIZE}
+   --sequence-parallel
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
-   # max-tokens-per-gpu is one CP rank's slice of MAX_CONTEXT_LEN; log-probs are
-   # chunked along T to avoid OOM on long single trajectories.
    --max-tokens-per-gpu $((MAX_CONTEXT_LEN / CP_SIZE))
    --log-probs-chunk-size 1024
    --use-dynamic-batch-size
@@ -182,8 +129,9 @@ SGLANG_ARGS=(
    --sglang-ep-size ${ROLLOUT_EP_SIZE}
    --sglang-enable-dp-lm-head
    --sglang-moe-dense-tp-size 1
-   --sglang-tool-call-parser qwen3_coder
-   --sglang-reasoning-parser qwen3
+   # No --sglang-tool-call-parser / --sglang-reasoning-parser: DeepSeek-V3-0321
+   # does not use a special reasoning format or coder-mode tool-call parser.
+   # Add --sglang-tool-call-parser deepseek_v3 if your sglang build supports it.
 )
 
 MISC_ARGS=(
@@ -191,21 +139,20 @@ MISC_ARGS=(
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
-   --attention-backend flash
+   # MLA + flash attention: leave disabled until verified for this model family.
+   # --attention-backend flash
    --moe-token-dispatcher-type flex
    --moe-enable-deepep
    --colocate
 )
 
 # ============ ray cluster network ============
-# Set MASTER_ADDR before the SWE block: ADAPTER_PUBLIC_HOST below falls back to it.
 export MASTER_ADDR="${MASTER_ADDR:-${MLP_WORKER_0_HOST:-$(hostname -I | awk '{print $1}')}}"
 export MASTER_PORT="${MASTER_PORT:-${MLP_WORKER_0_PORT:-6379}}"
 export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-${MLP_SOCKET_IFNAME:-eth0}}"
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-${MLP_SOCKET_IFNAME:-eth0}}"
 
 # ============ SWE / OpenHands rollout knobs ============
-
 export SWE_AGENT="${SWE_AGENT:-openhands}"
 export SWE_TRAIN_PROTOCOL="${SWE_TRAIN_PROTOCOL:-scaleswe}"
 export E2B_API_KEY="${E2B_API_KEY:-e2b_0000000000000000000000000000000000000000}"
@@ -222,14 +169,11 @@ export SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY="${SLIME_AGENT_SANDBOX_IMAGE_METAD
 # that mount. Forwarded to workers by the SLIME_/SWE_ prefix loop below.
 export SLIME_SANDBOX_TEMPLATE="${SLIME_SANDBOX_TEMPLATE:-swe-openhands}"
 
-# OpenHands agent knobs.
 export SWE_OH_FAKE_USER="${SWE_OH_FAKE_USER:-0}"
 export SWE_OH_MAX_ITERATIONS="${SWE_OH_MAX_ITERATIONS:-100}"
 export SWE_OH_TOOLS="${SWE_OH_TOOLS:-file_editor,terminal,task_tracker,think,finish}"
-# Arbitrary extra env vars forwarded verbatim into the OH agent's shell (JSON obj).
 # export SLIME_AGENT_OH_EXTRA_ENVS='{"HTTPS_PROXY":"http://proxy:8080"}'
 
-# ADAPTER_PUBLIC_HOST must be routable from inside the sandbox (not 127.0.0.1).
 export ADAPTER_PUBLIC_HOST="${ADAPTER_PUBLIC_HOST:-${MASTER_ADDR:-${MLP_WORKER_0_HOST:-127.0.0.1}}}"
 export ADAPTER_BIND_HOST="${ADAPTER_BIND_HOST:-0.0.0.0}"
 export ADAPTER_PORT="${ADAPTER_PORT:-18001}"
@@ -244,30 +188,11 @@ export NO_PROXY="${no_proxy}"
 
 cd "${SLIME_DIR}"
 
-# ============ bring up ray cluster ============
-HOSTFILE="${HOSTFILE:-/root/mpi_rack_hostfile}"
+# ============ ray cluster (assumed already running) ============
+# This variant does not start Ray or SSH into workers; it only submits to an
+# existing cluster via RAY_API_SERVER_ADDRESS below.
 ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-${MLP_WORKER_NUM:-8}}"
 ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-8}"
-
-ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${ACTOR_NUM_GPUS_PER_NODE}" \
-   --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
-
-if [[ -f "${HOSTFILE}" ]]; then
-  for WORKER_IP in $(awk '{print $1}' "${HOSTFILE}"); do
-    [[ -z "${WORKER_IP}" ]] && continue
-    [[ "${WORKER_IP}" == "${MASTER_ADDR}" ]] && continue
-    echo "Starting Ray worker on ${WORKER_IP}"
-    ssh -o StrictHostKeyChecking=no "root@${WORKER_IP}" \
-      "pkill -9 sglang ; ray stop --force ; pkill -9 python ; \
-       ray start --address=${MASTER_ADDR}:6379 --num-gpus ${ACTOR_NUM_GPUS_PER_NODE} \
-         --node-ip-address ${WORKER_IP} --disable-usage-stats" &
-  done
-  wait
-fi
-
-echo "Waiting for Ray cluster to stabilize..."
-sleep 30
-ray status
 
 # ============ runtime env propagated to ray workers ============
 export SLIME_DIR
@@ -281,10 +206,9 @@ keys = (
 )
 env = {k: os.environ[k] for k in keys if k in os.environ}
 # Prefix pass-through: forward every slime / SWE knob automatically so new vars
-# need no per-var edit (see spec §5.1a). Matches bare SLIME_ (not just
-# SLIME_AGENT_) so knobs like SLIME_SANDBOX_TEMPLATE and
-# SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS are not silently dropped;
-# SLIME_AGENT_OH_EXTRA_ENVS rides this rule too.
+# need no per-var edit. Matches bare SLIME_ (not just SLIME_AGENT_) so knobs like
+# SLIME_SANDBOX_TEMPLATE and SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS are not
+# silently dropped; SLIME_AGENT_OH_EXTRA_ENVS rides this rule too.
 for k, v in os.environ.items():
     if k.startswith("SLIME_") or k.startswith("SWE_"):
         env[k] = v
@@ -300,9 +224,10 @@ print(json.dumps({"env_vars": env}))
 PY
 )
 
-ray job submit --address="http://127.0.0.1:8265" \
+ray job submit --address="${RAY_API_SERVER_ADDRESS:-http://127.0.0.1:8265}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   -- python3 -u train.py \
+   --working-dir="${RUN_ROOT}" \
+   -- python3 -u "${SLIME_DIR}/train.py" \
    --actor-num-nodes "${ACTOR_NUM_NODES}" \
    --actor-num-gpus-per-node "${ACTOR_NUM_GPUS_PER_NODE}" \
    "${MODEL_ARGS[@]}" \

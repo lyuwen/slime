@@ -1,16 +1,11 @@
 #!/usr/bin/env bash
-# End-to-end SWE coding-agent RL on 8 nodes. See README.md for the dataset
-# schema, env vars, and fan-out semantics. Run from a long-lived shell / tmux
-# session on the Ray head node (a short-lived nohup launcher gets its Ray child
-# processes cleaned up with it).
-
-# Best-effort cleanup so a rerun does not collide with stale workers.
-pkill -9 sglang || true
-sleep 3
-ray stop --force || true
-pkill -9 ray || true
-sleep 3
-pkill -9 ray || true
+# End-to-end SWE coding-agent RL on 8 nodes, EXTERNAL-CLUSTER variant.
+#
+# Unlike run_qwen36_35b_a3b_scaleswe_openhands_8nodes.sh, this script does NOT
+# start/stop Ray or SSH into workers: the Ray cluster is assumed to be already
+# up (head + workers joined), and we only submit the job to it. Point
+# RAY_API_SERVER_ADDRESS at the running head's dashboard (default
+# http://127.0.0.1:8265). See README.md for the dataset schema and env vars.
 
 set -ex
 
@@ -244,30 +239,11 @@ export NO_PROXY="${no_proxy}"
 
 cd "${SLIME_DIR}"
 
-# ============ bring up ray cluster ============
-HOSTFILE="${HOSTFILE:-/root/mpi_rack_hostfile}"
+# ============ ray cluster (assumed already running) ============
+# This variant does not start Ray or SSH into workers; it only submits to an
+# existing cluster via RAY_API_SERVER_ADDRESS below.
 ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-${MLP_WORKER_NUM:-8}}"
 ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-8}"
-
-ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${ACTOR_NUM_GPUS_PER_NODE}" \
-   --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
-
-if [[ -f "${HOSTFILE}" ]]; then
-  for WORKER_IP in $(awk '{print $1}' "${HOSTFILE}"); do
-    [[ -z "${WORKER_IP}" ]] && continue
-    [[ "${WORKER_IP}" == "${MASTER_ADDR}" ]] && continue
-    echo "Starting Ray worker on ${WORKER_IP}"
-    ssh -o StrictHostKeyChecking=no "root@${WORKER_IP}" \
-      "pkill -9 sglang ; ray stop --force ; pkill -9 python ; \
-       ray start --address=${MASTER_ADDR}:6379 --num-gpus ${ACTOR_NUM_GPUS_PER_NODE} \
-         --node-ip-address ${WORKER_IP} --disable-usage-stats" &
-  done
-  wait
-fi
-
-echo "Waiting for Ray cluster to stabilize..."
-sleep 30
-ray status
 
 # ============ runtime env propagated to ray workers ============
 export SLIME_DIR
@@ -300,9 +276,10 @@ print(json.dumps({"env_vars": env}))
 PY
 )
 
-ray job submit --address="http://127.0.0.1:8265" \
+ray job submit --address="${RAY_API_SERVER_ADDRESS:-http://127.0.0.1:8265}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   -- python3 -u train.py \
+   --working-dir="${RUN_ROOT}" \
+   -- python3 -u "${SLIME_DIR}/train.py" \
    --actor-num-nodes "${ACTOR_NUM_NODES}" \
    --actor-num-gpus-per-node "${ACTOR_NUM_GPUS_PER_NODE}" \
    "${MODEL_ARGS[@]}" \
