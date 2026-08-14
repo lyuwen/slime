@@ -105,5 +105,35 @@ def test_get_prompt_template_render_error():
         Path(template_path).unlink(missing_ok=True)
 
 
+def test_get_prompt_with_legacy_template():
+    """Integration test: legacy.j2 should render with slime metadata"""
+    # Point to the actual legacy.j2 template
+    legacy_template = Path(__file__).parent.parent.parent / "thirdparty" / "legacy.j2"
+
+    if not legacy_template.exists():
+        pytest.skip(f"legacy.j2 not found at {legacy_template}")
+
+    os.environ["SWE_PROMPT_TEMPLATE_PATH"] = str(legacy_template)
+
+    try:
+        md = {
+            "problem_statement": "Migrate testing from nose to pytest",
+            "workdir": "/workspace/beets",
+            "instance_id": "beetbox_beets_pr3661",
+            "image": "registry.example.com/scaleswe:beetbox_beets_pr3661",
+            "protocol": "scaleswe",
+        }
+
+        result = get_prompt(md)
+
+        # Check that template rendered with expected content
+        assert "Migrate testing from nose to pytest" in result
+        assert "/workspace/beets" in result or "uploaded" in result.lower()
+        # legacy.j2 has phases like "Phase 1. READING"
+        assert "Phase" in result or "phase" in result
+    finally:
+        os.environ.pop("SWE_PROMPT_TEMPLATE_PATH", None)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
