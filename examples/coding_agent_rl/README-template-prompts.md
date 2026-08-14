@@ -69,6 +69,16 @@ Run the tests:
 python examples/coding_agent_rl/test_generate_prompt.py
 ```
 
+## Security Considerations
+
+**Important:** `SWE_PROMPT_TEMPLATE_PATH` must point to trusted template files only. The template rendering mechanism:
+
+- Reads arbitrary files from the filesystem (within Jinja2's loader constraints)
+- Executes template logic that could access the metadata context
+- Is mitigated by Jinja2's sandboxed template parsing, but still requires trusted template sources
+
+**Do not** point `SWE_PROMPT_TEMPLATE_PATH` to user-uploaded files, untrusted network locations, or world-writable directories. Template files should be part of your controlled configuration or checked into version control.
+
 ## Implementation Details
 
 The `get_prompt()` function:

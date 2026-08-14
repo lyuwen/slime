@@ -128,9 +128,8 @@ def test_get_prompt_with_legacy_template():
 
         # Check that template rendered with expected content
         assert "Migrate testing from nose to pytest" in result
-        assert "/workspace/beets" in result or "uploaded" in result.lower()
-        # legacy.j2 has phases like "Phase 1. READING"
-        assert "Phase" in result or "phase" in result
+        # legacy.j2 has unique phrases like "Phase 1. READING" that won't appear in fallback
+        assert "READING" in result or "Phase 1" in result
     finally:
         os.environ.pop("SWE_PROMPT_TEMPLATE_PATH", None)
 
