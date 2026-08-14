@@ -60,6 +60,7 @@ echo "======================================================================"
 echo "Training log: ${LOG_FILE}"
 echo "RUN_ROOT=${RUN_ROOT}"
 echo "======================================================================"
+export TENSORBOARD_DIR=${LOG_DIR}/tensorboard
 
 MODEL_ARGS=(
    --spec "slime_plugins.models.qwen3_5" "get_qwen3_5_spec"
@@ -108,6 +109,9 @@ MODEL_ARGS=(
 CKPT_ARGS=(
    --hf-checkpoint "${HF_CHECKPOINT}"
    --ref-load "${REF_MODEL_PATH}"
+   --load "${RUN_ROOT}/checkpoints"
+   --save "${RUN_ROOT}/checkpoints"
+   --save-interval 10
 )
 
 ROLLOUT_ARGS=(
@@ -179,6 +183,8 @@ SGLANG_ARGS=(
    --sglang-moe-dense-tp-size 1
    --sglang-tool-call-parser qwen3_coder
    --sglang-reasoning-parser qwen3
+   --router-policy consistent_hashing
+   --sglang-server-concurrency 16
 )
 
 MISC_ARGS=(
@@ -190,6 +196,7 @@ MISC_ARGS=(
    --moe-token-dispatcher-type flex
    --moe-enable-deepep
    --colocate
+   --use-tensorboard
 )
 
 # ============ ray cluster network ============
@@ -254,6 +261,7 @@ keys = (
     "no_proxy", "NO_PROXY",
     "E2B_DOMAIN", "E2B_API_KEY", "ADAPTER_PUBLIC_HOST",
     "ADAPTER_BIND_HOST", "ADAPTER_PORT",
+    "TENSORBOARD_DIR",
 )
 env = {k: os.environ[k] for k in keys if k in os.environ}
 # Prefix pass-through: forward every slime / SWE knob automatically so new vars

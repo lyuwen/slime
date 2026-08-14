@@ -124,6 +124,15 @@ async def boot_agent_sandbox(image: str, instance_id: str) -> AsyncIterator[E2BS
             async with _BOOT_SEM:
                 await cand.__aenter__()
                 try:
+                    # Temporary sanitation for recycled Kruise sandboxes.
+                    # Remove transient state potentially left by a previous claimant.
+                    await cand.exec(
+                        "rm -f /tmp/.run.sh /tmp/.run-*.sh /etc/gitconfig.lock; chmod 1777 /tmp",
+                        user="root",
+                        check=True,
+                        timeout=30,
+                    )
+
                     await HARNESS_CLS().install_cli(cand)
                 except BaseException:
                     await cand.__aexit__(None, None, None)
