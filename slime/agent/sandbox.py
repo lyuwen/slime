@@ -14,6 +14,7 @@ import logging
 import os
 import random
 import time
+import uuid
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -121,10 +122,17 @@ async def exec_and_wait(
     ``_await_done_marker``) -- none of which depend on a stream staying alive,
     and the polling doubles as an idle-GC keepalive while the command runs.
     """
-    out_file = out_file or f"/tmp/.{tag}.out"
-    done_file = f"/tmp/.{tag}.done"
-    launcher = f"/tmp/.{tag}.sh"
-    lock_dir = f"/tmp/.{tag}.spawned"
+    # Per-call unique base for the launcher/marker/lock/out paths. A fixed
+    # /tmp/.{tag}.* collides across runs: if the path already exists owned by a
+    # different user (baked into the image, or left by a prior run in a recycled
+    # sandbox), the next user's write_file cannot reopen it and the gateway
+    # returns "open /tmp/.run.sh: permission denied". The uuid keeps tag in the
+    # name for debuggability while guaranteeing a fresh, unowned path each call.
+    slug = f"{tag}-{uuid.uuid4().hex[:12]}"
+    out_file = out_file or f"/tmp/.{slug}.out"
+    done_file = f"/tmp/.{slug}.done"
+    launcher = f"/tmp/.{slug}.sh"
+    lock_dir = f"/tmp/.{slug}.spawned"
     prefix = f"cd {workdir}\nexport HOME=/home/{user}\n" if workdir else ""
     launcher_body = f"#!/bin/bash\n{prefix}{cmd}\necho $? > {done_file}\n"
     await sb.write_file(launcher, launcher_body, user=user)

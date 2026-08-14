@@ -110,7 +110,7 @@ def test_launch_command_and_extra_env_merge():
                 )
         assert rc == 0
         # the driver is launched with the baked interpreter against the config file
-        body = next(v for k, v in sb.files.items() if k.endswith("run.sh"))
+        body = next(v for k, v in sb.files.items() if k.endswith(".sh") and "run-" in k)
         assert "/opt/oh-env/bin/python /home/agent/oh_driver.py /home/agent/oh_config.json" in body
         # extra_envs reach the agent process, merged LAST (override wins)
         env = captured["env"]

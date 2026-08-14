@@ -301,7 +301,7 @@ def _as_str(v: str | bytes) -> str:
 def _done_path_from_launch(cmd: str) -> str | None:
     """Recover the exit-code marker path from a ``setsid bash {launcher}`` command
     so the subsequent poll matches. ``sandbox.exec_and_wait`` names the launcher
-    ``/tmp/.{tag}.sh`` and its sibling marker ``/tmp/.{tag}.done``."""
+    ``/tmp/.{tag}-{uuid}.sh`` and its sibling marker ``/tmp/.{tag}-{uuid}.done``."""
     m = re.search(r"setsid bash (\S+)\.sh\b", cmd)
     if m:
         return f"{m.group(1)}.done"

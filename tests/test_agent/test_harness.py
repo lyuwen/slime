@@ -68,7 +68,7 @@ def test_run_agent_returns_marker_exit_code():
         assert rc == 0
         assert seen["env"] == {"A": "1"}
         # launcher script + detached setsid launch all issued, exit code captured.
-        assert any("run.sh" in p for p in sb.files)
+        assert any(p.endswith(".sh") and "run-" in p for p in sb.files)
         assert _find(sb.exec_log, "setsid")
         assert any("echo $?" in v for v in sb.files.values())
 
@@ -130,7 +130,7 @@ def test_claude_code_launch_command_and_env():
             )
         assert rc == 0
         # the prompt + flags land in the launcher script body.
-        body = next(v for k, v in capturing.files.items() if k.endswith("run.sh"))
+        body = next(v for k, v in capturing.files.items() if k.endswith(".sh") and "run-" in k)
         assert "claude -p 'solve it'" in body
         assert "--permission-mode bypassPermissions" in body
         # env carries the adapter wiring under the Anthropic var names.
@@ -177,7 +177,7 @@ def test_codex_launch_command_and_env():
                 sb, _ctx(sid="sess-cx", url="http://host:18001"), prompt="do work", time_budget_sec=30
             )
         assert rc == 0
-        body = next(v for k, v in sb.files.items() if k.endswith("run.sh"))
+        body = next(v for k, v in sb.files.items() if k.endswith(".sh") and "run-" in k)
         assert "codex exec" in body and "do work" in body and "--skip-git-repo-check" in body
         env = captured["env"]
         assert env["OPENAI_API_KEY"] == "sess-cx"
