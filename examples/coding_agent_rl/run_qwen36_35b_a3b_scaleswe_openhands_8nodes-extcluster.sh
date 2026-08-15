@@ -185,6 +185,7 @@ SGLANG_ARGS=(
    --sglang-reasoning-parser qwen3
    --router-policy consistent_hashing
    --sglang-server-concurrency 16
+   --apply-chat-template-kwargs '{"preserve_thinking":true}'
 )
 
 MISC_ARGS=(
@@ -228,8 +229,12 @@ export SLIME_SANDBOX_TEMPLATE="${SLIME_SANDBOX_TEMPLATE:-swe-openhands}"
 export SWE_OH_FAKE_USER="${SWE_OH_FAKE_USER:-0}"
 export SWE_OH_MAX_ITERATIONS="${SWE_OH_MAX_ITERATIONS:-100}"
 export SWE_OH_TOOLS="${SWE_OH_TOOLS:-file_editor,terminal,task_tracker,think,finish}"
+export SWE_PROMPT_TEMPLATE_PATH="${PWD}/prompt-template.j2"
+export SWE_TRAJECTORY_DIR="${RUN_ROOT}/trajectories"
 # Arbitrary extra env vars forwarded verbatim into the OH agent's shell (JSON obj).
 # export SLIME_AGENT_OH_EXTRA_ENVS='{"HTTPS_PROXY":"http://proxy:8080"}'
+export SLIME_AGENT_OH_EXTRA_ENVS='{"OH_SEND_REASONING_CONTENT":"yes"}'
+# export SLIME_AGENT_OH_EXTRA_ENVS='{"OH_SEND_REASONING_CONTENT":"yes","OH_VALIDATE_TOOLCALL_PARAMS":"on"}'
 
 # ADAPTER_PUBLIC_HOST must be routable from inside the sandbox (not 127.0.0.1).
 export ADAPTER_PUBLIC_HOST="${ADAPTER_PUBLIC_HOST:-${MASTER_ADDR:-${MLP_WORKER_0_HOST:-127.0.0.1}}}"
