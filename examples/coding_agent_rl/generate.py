@@ -23,6 +23,7 @@ import logging
 import os
 import random
 import secrets
+import tempfile
 import time
 import traceback
 from collections.abc import AsyncIterator
@@ -302,6 +303,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         max_context_tokens=state.max_context_len,
     )
     t0 = time.time()
+    traj_data = None
     try:
         async with asyncio.timeout(CONFIG.rollout_guard_sec):
             async with boot_agent_sandbox(md["image"], instance_id) as sb:
@@ -326,12 +328,27 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     **oh_kwargs,
                 )
                 diff_text = await swe.git_diff(sb, md["workdir"])
+                if AGENT_NAME == "openhands":
+                    traj_data = await _read_sandbox_trajectory(sb, OpenHandsHarness.trajectory_sandbox_path)
 
             reward, applied_cleanly = await swe.run_evaluation(
                 md,
                 diff_text=diff_text,
                 timeout_sec=CONFIG.eval_timeout_sec,
             )
+            if traj_data is not None:
+                _persist_trajectory(
+                    _trajectory_root(),
+                    base_sample,
+                    messages=traj_data["messages"],
+                    tools=traj_data["tools"],
+                    diff_text=diff_text,
+                    reward=float(reward),
+                    applied_cleanly=bool(applied_cleanly),
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    agent_exit_code=agent_exit_code,
+                )
             if evaluation:
                 logger.info(
                     "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs (eval-only)",
@@ -426,6 +443,99 @@ def _session_id(sample: Sample, instance_id: str) -> str:
     if sample.index is not None and sample.group_index is not None:
         return f"cagent-{instance_id}-{sample.index}-{sample.group_index}"
     return f"cagent-{instance_id}-{secrets.token_hex(8)}"
+
+
+def _trajectory_root() -> str:
+    return os.environ.get("SWE_TRAJECTORY_DIR", "trajectories")
+
+
+def _trajectory_final_path(root: str, sample: Sample) -> str:
+    group_index = "unknown" if sample.group_index is None else str(sample.group_index)
+    index = "unknown" if sample.index is None else str(sample.index)
+    return os.path.join(root, group_index, f"{group_index}_{index}.json")
+
+
+def _warn_trajectory(message: str, *args) -> None:
+    try:
+        logger.warning(message, *args)
+    except Exception:
+        pass
+
+
+async def _read_sandbox_trajectory(sb, path: str) -> dict | None:
+    """Return the parsed sandbox trajectory object, or None on read/parse failure.
+
+    Accepts only an object with ``messages`` (list) and ``tools`` (list).
+    Any other shape — bare list, missing key, or non-list field — is rejected
+    with a warning. All warning failures are swallowed (best-effort).
+    """
+    try:
+        raw = await sb.read_file(path, user="agent")
+    except Exception as error:
+        _warn_trajectory("[coding_agent_rl] trajectory read failed for %s: %s", path, error)
+        return None
+    if not raw:
+        _warn_trajectory("[coding_agent_rl] trajectory content empty or missing at %s", path)
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception as error:
+        _warn_trajectory("[coding_agent_rl] trajectory read or parse failed for %s: %s", path, error)
+        return None
+    if (
+        not isinstance(data, dict)
+        or not isinstance(data.get("messages"), list)
+        or not isinstance(data.get("tools"), list)
+    ):
+        _warn_trajectory(
+            "[coding_agent_rl] trajectory has unexpected shape at %s: %s",
+            path,
+            type(data).__name__,
+        )
+        return None
+    return data
+
+
+def _persist_trajectory(
+    root: str,
+    sample: Sample,
+    *,
+    messages: list,
+    tools: list,
+    diff_text: str,
+    reward: float,
+    applied_cleanly: bool,
+    instance_id: str,
+    session_id: str,
+    agent_exit_code: int | None,
+) -> None:
+    """Best-effort atomic write of the enriched trajectory document."""
+    try:
+        path = _trajectory_final_path(root, sample)
+        directory = os.path.dirname(path)
+        os.makedirs(directory, exist_ok=True)
+        doc = {
+            "messages": messages,
+            "tools": tools,
+            "diff_text": diff_text,
+            "reward": reward,
+            "applied_cleanly": applied_cleanly,
+            "instance_id": instance_id,
+            "group_index": sample.group_index,
+            "index": sample.index,
+            "session_id": session_id,
+            "agent_exit_code": agent_exit_code,
+        }
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".traj_", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as file:
+                json.dump(doc, file)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+    except Exception as error:
+        _warn_trajectory("[coding_agent_rl] %s: trajectory persist skipped: %s", instance_id, error)
 
 
 def _abort_result(sample: Sample, reason: str, instance_id: str) -> list[Sample]:

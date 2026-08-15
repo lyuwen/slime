@@ -42,6 +42,7 @@ class OpenHandsHarness(BaseHarness):
     driver_sandbox_path = "/home/agent/oh_driver.py"
     config_sandbox_path = "/home/agent/oh_config.json"
     prompt_sandbox_path = "/home/agent/oh_prompt.txt"
+    trajectory_sandbox_path = "/home/agent/oh_trajectory.json"
 
     async def install_cli(self, sb: Sandbox) -> None:
         """Verify the oh-env image volume is mounted at the fixed prefix.
@@ -93,6 +94,7 @@ class OpenHandsHarness(BaseHarness):
             "fake_user": bool(fake_user),
             "max_iterations": int(max_iterations),
             "tools": list(tools),
+            "trajectory_path": self.trajectory_sandbox_path,
         }
         await sb.write_file(self.config_sandbox_path, json.dumps(config), user="agent")
         await sb.exec(
