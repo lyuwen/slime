@@ -126,5 +126,14 @@ def test_write_trajectory_atomic_and_best_effort(tmp_path, monkeypatch):
     oh_driver.write_trajectory(str(dest), [object()])  # no exception
 
 
+def test_write_trajectory_is_best_effort_when_diagnostic_raises(tmp_path, monkeypatch):
+    # a conversion failure AND a failing stderr diagnostic must not raise
+    monkeypatch.setattr(oh_driver, "events_to_trajectory", lambda evs: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(
+        oh_driver, "print", lambda *a, **k: (_ for _ in ()).throw(OSError("stderr failed")), raising=False
+    )
+    oh_driver.write_trajectory(str(tmp_path / "oh_trajectory.json"), [object()])  # no exception
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

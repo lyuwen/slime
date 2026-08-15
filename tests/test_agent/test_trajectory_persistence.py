@@ -100,6 +100,23 @@ def test_persist_is_best_effort_on_bad_root(monkeypatch):
     )
 
 
+def test_persist_is_best_effort_when_warning_raises(monkeypatch):
+    monkeypatch.setattr(G.os, "makedirs", lambda *a, **k: (_ for _ in ()).throw(OSError("nope")))
+    monkeypatch.setattr(G.logger, "warning", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("log failed")))
+
+    G._persist_trajectory(
+        "/root",
+        _sample(),
+        messages=[],
+        diff_text="",
+        reward=0.0,
+        applied_cleanly=False,
+        instance_id="i",
+        session_id="s",
+        agent_exit_code=1,
+    )
+
+
 class _FakeSB:
     def __init__(self, payload):
         self._payload = payload
@@ -120,6 +137,16 @@ def test_read_sandbox_trajectory_parses_and_warns_on_garbage(caplog):
     assert any("empty or missing" in message for message in messages)
     assert any("read or parse failed" in message for message in messages)
     assert any("unexpected top-level type" in message for message in messages)
+
+
+def test_read_sandbox_trajectory_is_best_effort_when_warning_raises(monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(G.logger, "warning", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("log failed")))
+
+    assert asyncio.run(G._read_sandbox_trajectory(_FakeSB(""), "/p")) is None
+    assert asyncio.run(G._read_sandbox_trajectory(_FakeSB("not json"), "/p")) is None
+    assert asyncio.run(G._read_sandbox_trajectory(_FakeSB('{"messages": []}'), "/p")) is None
 
 
 if __name__ == "__main__":

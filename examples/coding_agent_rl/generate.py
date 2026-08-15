@@ -454,23 +454,30 @@ def _trajectory_final_path(root: str, sample: Sample) -> str:
     return os.path.join(root, group_index, f"{group_index}_{index}.json")
 
 
+def _warn_trajectory(message: str, *args) -> None:
+    try:
+        logger.warning(message, *args)
+    except Exception:
+        pass
+
+
 async def _read_sandbox_trajectory(sb, path: str) -> list | None:
     """Return the parsed sandbox trajectory list, or None on read/parse failure."""
     try:
         raw = await sb.read_file(path, user="agent")
     except Exception as error:
-        logger.warning("[coding_agent_rl] trajectory read failed for %s: %s", path, error)
+        _warn_trajectory("[coding_agent_rl] trajectory read failed for %s: %s", path, error)
         return None
     if not raw:
-        logger.warning("[coding_agent_rl] trajectory content empty or missing at %s", path)
+        _warn_trajectory("[coding_agent_rl] trajectory content empty or missing at %s", path)
         return None
     try:
         data = json.loads(raw)
     except Exception as error:
-        logger.warning("[coding_agent_rl] trajectory read or parse failed for %s: %s", path, error)
+        _warn_trajectory("[coding_agent_rl] trajectory read or parse failed for %s: %s", path, error)
         return None
     if not isinstance(data, list):
-        logger.warning(
+        _warn_trajectory(
             "[coding_agent_rl] trajectory has unexpected top-level type at %s: %s",
             path,
             type(data).__name__,
@@ -516,7 +523,7 @@ def _persist_trajectory(
             if os.path.exists(tmp):
                 os.remove(tmp)
     except Exception as error:
-        logger.warning("[coding_agent_rl] %s: trajectory persist skipped: %s", instance_id, error)
+        _warn_trajectory("[coding_agent_rl] %s: trajectory persist skipped: %s", instance_id, error)
 
 
 def _abort_result(sample: Sample, reason: str, instance_id: str) -> list[Sample]:

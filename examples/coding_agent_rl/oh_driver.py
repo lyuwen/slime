@@ -150,6 +150,13 @@ def events_to_trajectory(events) -> list:
     return [m.model_copy(update={"send_reasoning_content": True}).to_chat_dict() for m in messages]
 
 
+def _warn_trajectory(message: str) -> None:
+    try:
+        print(message, file=sys.stderr)
+    except Exception:
+        pass
+
+
 def write_trajectory(path: str, events) -> None:
     """Best-effort atomic dump of the converted trajectory to ``path``.
 
@@ -168,7 +175,7 @@ def write_trajectory(path: str, events) -> None:
             if os.path.exists(tmp):
                 os.remove(tmp)
     except Exception as e:  # best-effort: never abort the run over a trace failure
-        print(f"[oh_driver] trajectory persistence skipped: {type(e).__name__}: {e}", file=sys.stderr)
+        _warn_trajectory(f"[oh_driver] trajectory persistence skipped: {type(e).__name__}: {e}")
 
 
 def main(config_path: str) -> int:
