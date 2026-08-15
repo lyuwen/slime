@@ -178,6 +178,7 @@ class _AdapterService(metaclass=SingletonMeta):
             tool_parser=self.tool_parser,
             reasoning_parser=self.reasoning_parser,
             fork_threshold_tokens=CONFIG.fork_merge_threshold,
+            chat_template_kwargs=getattr(args, "apply_chat_template_kwargs", None),
         )
         # handler_cancellation=True so a client disconnect cancels the handler
         # coroutine, arming the fire-and-forget /abort_request in the adapter.

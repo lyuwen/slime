@@ -495,5 +495,29 @@ def test_body_sampling_applies_when_default_unset():
     assert sp["top_k"] == 20
 
 
+# ---------------------------------------------------------------------------
+# chat-template kwargs forwarding
+# ---------------------------------------------------------------------------
+
+
+def test_render_token_ids_forwards_chat_template_kwargs():
+    # Kwargs threaded from --apply-chat-template-kwargs must reach
+    # tokenizer.apply_chat_template (e.g. enable_thinking) on the agent path.
+    from slime.agent.adapters.common import _render_token_ids
+
+    tok = FakeTokenizer()
+    msgs = [{"role": "user", "content": "hi"}]
+    _render_token_ids(msgs, tok, tools=None, chat_template_kwargs={"enable_thinking": False})
+    assert tok.render_kwargs[-1] == {"enable_thinking": False}
+
+
+def test_render_token_ids_default_passes_no_extra_kwargs():
+    from slime.agent.adapters.common import _render_token_ids
+
+    tok = FakeTokenizer()
+    _render_token_ids([{"role": "user", "content": "hi"}], tok, tools=None)
+    assert tok.render_kwargs[-1] == {}
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
