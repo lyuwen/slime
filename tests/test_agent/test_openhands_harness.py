@@ -87,6 +87,25 @@ def test_write_config_drops_driver_config_and_prompt():
     asyncio.run(run_case())
 
 
+def test_write_config_advertises_trajectory_path():
+    async def run_case():
+        sb = FakeSandbox()
+        with patch.object(OpenHandsHarness, "driver_host_path", Path(__file__)):
+            await OpenHandsHarness().write_config(
+                sb,
+                _ctx(),
+                prompt="p",
+                fake_user=False,
+                max_iterations=1,
+                tools=[],
+                extra_envs={},
+            )
+        cfg = json.loads(sb.files["/home/agent/oh_config.json"])
+        assert cfg["trajectory_path"] == "/home/agent/oh_trajectory.json"
+
+    asyncio.run(run_case())
+
+
 def test_launch_command_and_extra_env_merge():
     async def run_case():
         captured = {}
