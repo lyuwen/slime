@@ -15,7 +15,9 @@ SDK is absent. All openhands imports happen lazily inside functions.
 from __future__ import annotations
 
 import json
+import os
 import sys
+import tempfile
 
 # Tool name -> the import path of the module whose import calls register_tool for
 # it. Default preset: file_editor/terminal/task_tracker. Legacy preset also
@@ -129,6 +131,46 @@ def _run_with_fake_user(conv, max_nudges: int = 100) -> None:
         conv.send_message(nudge)
 
 
+def _isinstance_convertible(event) -> bool:
+    from openhands.sdk.event.base import LLMConvertibleEvent
+
+    return isinstance(event, LLMConvertibleEvent)
+
+
+def events_to_trajectory(events) -> list:
+    """Reconstruct the LLM message/tool-call trajectory from OpenHands events.
+
+    Pure transform: keep only LLMConvertibleEvent records, fold them into chat
+    messages via the SDK, and emit chat dicts with reasoning content retained.
+    """
+    from openhands.sdk.event.base import LLMConvertibleEvent
+
+    convertible = [e for e in events if _isinstance_convertible(e)]
+    messages = LLMConvertibleEvent.events_to_messages(convertible)
+    return [m.model_copy(update={"send_reasoning_content": True}).to_chat_dict() for m in messages]
+
+
+def write_trajectory(path: str, events) -> None:
+    """Best-effort atomic dump of the converted trajectory to ``path``.
+
+    Runs inside the sandbox as user ``agent``; any failure is swallowed so a
+    trace problem never aborts an otherwise-complete run.
+    """
+    try:
+        payload = events_to_trajectory(events)
+        directory = os.path.dirname(path) or "."
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".oh_traj_", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(payload, f)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+    except Exception as e:  # best-effort: never abort the run over a trace failure
+        print(f"[oh_driver] trajectory persistence skipped: {type(e).__name__}: {e}", file=sys.stderr)
+
+
 def main(config_path: str) -> int:
     from openhands.sdk import LLM, Agent, Conversation
     from openhands.sdk.workspace import LocalWorkspace
@@ -174,6 +216,9 @@ def main(config_path: str) -> int:
         _run_with_fake_user(conv)
     else:
         conv.run()
+    trajectory_path = cfg.get("trajectory_path")
+    if trajectory_path:
+        write_trajectory(trajectory_path, conv.state.events)
     return 0
 
 

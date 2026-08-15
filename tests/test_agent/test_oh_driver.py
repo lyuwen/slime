@@ -9,6 +9,7 @@ is covered by the GPU e2e follow-up, not this CPU test.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -69,6 +70,44 @@ def test_build_tools_unknown_name_raises():
         assert "not_a_tool" in str(e)
     else:
         raise AssertionError("expected ValueError for unknown tool name")
+
+
+class _FakeMsg:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def model_copy(self, update=None):
+        assert update == {"send_reasoning_content": True}
+        return self
+
+    def to_chat_dict(self):
+        return self._payload
+
+
+def test_events_to_trajectory_converts_and_flags_reasoning(monkeypatch):
+    import types
+
+    convertible = [object(), object()]
+    fake_base = types.SimpleNamespace(
+        LLMConvertibleEvent=types.SimpleNamespace(
+            events_to_messages=lambda evs: [_FakeMsg({"role": "assistant", "content": "hi"})],
+        )
+    )
+    # only the two convertible objects are instances; a plain int is filtered out
+    monkeypatch.setitem(sys.modules, "openhands.sdk.event.base", fake_base)
+    monkeypatch.setattr(oh_driver, "_isinstance_convertible", lambda e: e in convertible, raising=False)
+    out = oh_driver.events_to_trajectory(convertible + [123])
+    assert out == [{"role": "assistant", "content": "hi"}]
+
+
+def test_write_trajectory_atomic_and_best_effort(tmp_path, monkeypatch):
+    monkeypatch.setattr(oh_driver, "events_to_trajectory", lambda evs: [{"role": "user", "content": "x"}])
+    dest = tmp_path / "oh_trajectory.json"
+    oh_driver.write_trajectory(str(dest), [object()])
+    assert json.loads(dest.read_text()) == [{"role": "user", "content": "x"}]
+    # best-effort: a conversion failure must not raise
+    monkeypatch.setattr(oh_driver, "events_to_trajectory", lambda evs: (_ for _ in ()).throw(RuntimeError("boom")))
+    oh_driver.write_trajectory(str(dest), [object()])  # no exception
 
 
 if __name__ == "__main__":
