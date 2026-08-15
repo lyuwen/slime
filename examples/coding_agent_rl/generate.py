@@ -28,7 +28,10 @@ import traceback
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+from jinja2 import Environment, FileSystemLoader, TemplateError
 
 from slime.agent.adapters import AnthropicAdapter, OpenAIAdapter
 from slime.agent.aiohttp_threaded import FilteredAccessLogger, run_app_in_thread
@@ -104,6 +107,81 @@ class SweConfig:
 
 
 CONFIG = SweConfig.from_env()
+
+
+def get_prompt(md: dict) -> str:
+    """Generate the agent prompt, optionally using a Jinja2 template.
+
+    If SWE_PROMPT_TEMPLATE_PATH is set, loads and renders that template
+    with the metadata dict. Otherwise falls back to the hardcoded SWE_PROMPT.
+
+    Args:
+        md: Metadata dict from swe.get_metadata(), containing:
+            - problem_statement: The task description
+            - workdir: Repository path in the sandbox
+            - instance_id: Unique identifier
+            - image: Docker image name
+            - protocol: Evaluation protocol
+
+    Returns:
+        Rendered prompt string to pass to the harness
+    """
+    template_path_str = os.environ.get("SWE_PROMPT_TEMPLATE_PATH", "").strip()
+
+    if not template_path_str:
+        return swe.SWE_PROMPT
+
+    template_path = Path(template_path_str)
+
+    try:
+        # Load template
+        if not template_path.exists():
+            logger.warning(
+                "[coding_agent_rl] Template file not found: %s; falling back to SWE_PROMPT",
+                template_path,
+            )
+            return swe.SWE_PROMPT
+
+        # Set up Jinja2 environment
+        template_dir = template_path.parent
+        template_name = template_path.name
+        env = Environment(loader=FileSystemLoader(str(template_dir)))
+        template = env.get_template(template_name)
+
+        # Build context with instance alias for legacy.j2 compatibility
+        context = {
+            "instance": {
+                "problem_statement": md.get("problem_statement", ""),
+                "repo_path": md.get("workdir", ""),
+                "workdir": md.get("workdir", ""),
+                "instance_id": md.get("instance_id", ""),
+                "image": md.get("image", ""),
+            },
+            "md": md,
+        }
+
+        # Render template
+        rendered = template.render(context)
+        logger.info("[coding_agent_rl] Using template prompt from %s", template_path)
+        return rendered
+
+    except TemplateError as e:
+        logger.error(
+            "[coding_agent_rl] Template rendering failed (%s): %s: %s; falling back to SWE_PROMPT",
+            template_path,
+            type(e).__name__,
+            str(e),
+        )
+        return swe.SWE_PROMPT
+    except Exception as e:
+        logger.error(
+            "[coding_agent_rl] Unexpected error loading template (%s): %s: %s; falling back to SWE_PROMPT",
+            template_path,
+            type(e).__name__,
+            str(e),
+        )
+        return swe.SWE_PROMPT
+
 
 _BOOT_SEM = asyncio.Semaphore(CONFIG.boot_concurrency)
 
@@ -243,7 +321,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     session_id=session_id,
                     adapter_url=state.adapter_url,
                     time_budget_sec=CONFIG.agent_time_budget_sec,
-                    prompt=swe.SWE_PROMPT,
+                    prompt=get_prompt(md),
                     **oh_kwargs,
                 )
                 diff_text = await swe.git_diff(sb, md["workdir"])
