@@ -61,6 +61,7 @@ def _render_token_ids(
     *,
     tools: list[dict] | None,
     add_generation_prompt: bool = True,
+    chat_template_kwargs: dict | None = None,
 ) -> list[int]:
     """Render a chat-message list to token ids with the served chat template."""
     enc = tokenizer.apply_chat_template(
@@ -68,6 +69,7 @@ def _render_token_ids(
         tools=tools,
         tokenize=True,
         add_generation_prompt=add_generation_prompt,
+        **(chat_template_kwargs or {}),
     )
     ids = enc["input_ids"] if hasattr(enc, "__getitem__") and "input_ids" in enc else enc
     return list(ids)
@@ -147,12 +149,14 @@ class BaseAdapter:
         reasoning_parser=None,
         max_turns_per_sid: int | None = None,
         fork_threshold_tokens: int | None = None,
+        chat_template_kwargs: dict | None = None,
         debug_callback: Callable[..., None] | None = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.sglang_url = sglang_url.rstrip("/") if isinstance(sglang_url, str) else sglang_url
         self.tool_parser = tool_parser
         self.reasoning_parser = reasoning_parser
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
         self.store: dict[str, Any] = {}
         self.inflight: dict[str, set[asyncio.Task]] = {}
         self.closed: set[str] = set()
@@ -339,7 +343,13 @@ class BaseAdapter:
         t0 = time.monotonic()
         try:
             translated, tools_schema = self._translate(body)
-            prompt_ids = _render_token_ids(translated, tok, tools=tools_schema, add_generation_prompt=True)
+            prompt_ids = _render_token_ids(
+                translated,
+                tok,
+                tools=tools_schema,
+                add_generation_prompt=True,
+                chat_template_kwargs=self.chat_template_kwargs,
+            )
 
             turn = await call_sglang_generate(prompt_ids, s, body, adapter=self, session_id=sid)
 
