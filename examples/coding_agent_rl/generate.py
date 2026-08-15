@@ -458,12 +458,25 @@ async def _read_sandbox_trajectory(sb, path: str) -> list | None:
     """Return the parsed sandbox trajectory list, or None on read/parse failure."""
     try:
         raw = await sb.read_file(path, user="agent")
-        if not raw:
-            return None
-        data = json.loads(raw)
-        return data if isinstance(data, list) else None
-    except Exception:
+    except Exception as error:
+        logger.warning("[coding_agent_rl] trajectory read failed for %s: %s", path, error)
         return None
+    if not raw:
+        logger.warning("[coding_agent_rl] trajectory content empty or missing at %s", path)
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception as error:
+        logger.warning("[coding_agent_rl] trajectory read or parse failed for %s: %s", path, error)
+        return None
+    if not isinstance(data, list):
+        logger.warning(
+            "[coding_agent_rl] trajectory has unexpected top-level type at %s: %s",
+            path,
+            type(data).__name__,
+        )
+        return None
+    return data
 
 
 def _persist_trajectory(

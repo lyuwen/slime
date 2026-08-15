@@ -59,6 +59,30 @@ def test_persist_writes_enriched_document(tmp_path):
     assert doc["instance_id"] == "inst-1"
     assert doc["group_index"] == 1 and doc["index"] == 3
     assert doc["session_id"] == "sid" and doc["agent_exit_code"] == 0
+    assert list((tmp_path / "1").glob(".traj_*.tmp")) == []
+
+
+def test_persist_replace_failure_is_best_effort_and_cleans_temp(tmp_path, monkeypatch):
+    directory = tmp_path / "2"
+    directory.mkdir()
+    final = directory / "2_7.json"
+    final.write_text("existing")
+    monkeypatch.setattr(G.os, "replace", lambda *args: (_ for _ in ()).throw(OSError("replace failed")))
+
+    G._persist_trajectory(
+        str(tmp_path),
+        _sample(),
+        messages=[],
+        diff_text="",
+        reward=0.0,
+        applied_cleanly=False,
+        instance_id="i",
+        session_id="s",
+        agent_exit_code=1,
+    )
+
+    assert final.read_text() == "existing"
+    assert list(directory.glob(".traj_*.tmp")) == []
 
 
 def test_persist_is_best_effort_on_bad_root(monkeypatch):
@@ -84,7 +108,7 @@ class _FakeSB:
         return self._payload
 
 
-def test_read_sandbox_trajectory_parses_and_tolerates_garbage():
+def test_read_sandbox_trajectory_parses_and_warns_on_garbage(caplog):
     import asyncio
 
     good = asyncio.run(G._read_sandbox_trajectory(_FakeSB('[{"role":"user"}]'), "/p"))
@@ -92,6 +116,10 @@ def test_read_sandbox_trajectory_parses_and_tolerates_garbage():
     assert asyncio.run(G._read_sandbox_trajectory(_FakeSB(""), "/p")) is None
     assert asyncio.run(G._read_sandbox_trajectory(_FakeSB("not json"), "/p")) is None
     assert asyncio.run(G._read_sandbox_trajectory(_FakeSB('{"messages": []}'), "/p")) is None
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("empty or missing" in message for message in messages)
+    assert any("read or parse failed" in message for message in messages)
+    assert any("unexpected top-level type" in message for message in messages)
 
 
 if __name__ == "__main__":

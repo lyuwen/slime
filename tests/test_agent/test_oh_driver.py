@@ -88,15 +88,22 @@ def test_events_to_trajectory_converts_and_flags_reasoning(monkeypatch):
     import types
 
     convertible = [object(), object()]
+    converted = []
+
+    def events_to_messages(events):
+        converted.append(events)
+        return [_FakeMsg({"role": "assistant", "content": "hi"})]
+
     fake_base = types.SimpleNamespace(
         LLMConvertibleEvent=types.SimpleNamespace(
-            events_to_messages=lambda evs: [_FakeMsg({"role": "assistant", "content": "hi"})],
+            events_to_messages=events_to_messages,
         )
     )
     # only the two convertible objects are instances; a plain int is filtered out
     monkeypatch.setitem(sys.modules, "openhands.sdk.event.base", fake_base)
     monkeypatch.setattr(oh_driver, "_isinstance_convertible", lambda e: e in convertible, raising=False)
     out = oh_driver.events_to_trajectory(convertible + [123])
+    assert converted == [convertible]
     assert out == [{"role": "assistant", "content": "hi"}]
 
 
@@ -105,6 +112,15 @@ def test_write_trajectory_atomic_and_best_effort(tmp_path, monkeypatch):
     dest = tmp_path / "oh_trajectory.json"
     oh_driver.write_trajectory(str(dest), [object()])
     assert json.loads(dest.read_text()) == [{"role": "user", "content": "x"}]
+    assert list(tmp_path.glob(".oh_traj_*.tmp")) == []
+
+    # os.replace failure is swallowed, leaves the prior file intact, and cleans the temp sibling
+    monkeypatch.setattr(oh_driver.os, "replace", lambda *args: (_ for _ in ()).throw(OSError("replace failed")))
+    oh_driver.write_trajectory(str(dest), [object()])
+    assert json.loads(dest.read_text()) == [{"role": "user", "content": "x"}]
+    assert list(tmp_path.glob(".oh_traj_*.tmp")) == []
+    monkeypatch.undo()
+
     # best-effort: a conversion failure must not raise
     monkeypatch.setattr(oh_driver, "events_to_trajectory", lambda evs: (_ for _ in ()).throw(RuntimeError("boom")))
     oh_driver.write_trajectory(str(dest), [object()])  # no exception
