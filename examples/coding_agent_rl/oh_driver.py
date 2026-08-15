@@ -150,6 +150,32 @@ def events_to_trajectory(events) -> list:
     return [m.model_copy(update={"send_reasoning_content": True}).to_chat_dict() for m in messages]
 
 
+def tools_to_trajectory(events, initial_tools) -> list:
+    """Extract OpenAI-format tool definitions from the event log.
+
+    Walks all events looking for the first SystemPromptEvent; if one is found,
+    iterates its ``.tools`` list and converts every ToolDefinition via
+    ``.to_openai_tool()``, skipping non-ToolDefinition entries (built-in sentinel
+    objects that have no serializable schema).
+
+    If no ToolDefinition is found in any SystemPromptEvent, falls back to the
+    ``initial_tools`` list supplied to Agent (same ToolDefinition filter applied).
+
+    The SystemPromptEvent list is preferred because it captures built-in/default
+    tools that the SDK injects beyond what the caller passes in ``tools=``.
+    """
+    from openhands.sdk.event import SystemPromptEvent
+    from openhands.sdk.tool import ToolDefinition
+
+    for event in events:
+        if isinstance(event, SystemPromptEvent):
+            result = [t.to_openai_tool() for t in event.tools if isinstance(t, ToolDefinition)]
+            if result:
+                return result
+    # Fallback: serialize ToolDefinition instances from the initial tools list.
+    return [t.to_openai_tool() for t in initial_tools if isinstance(t, ToolDefinition)]
+
+
 def _warn_trajectory(message: str) -> None:
     try:
         print(message, file=sys.stderr)
@@ -157,14 +183,19 @@ def _warn_trajectory(message: str) -> None:
         pass
 
 
-def write_trajectory(path: str, events) -> None:
+def write_trajectory(path: str, events, initial_tools=None) -> None:
     """Best-effort atomic dump of the converted trajectory to ``path``.
+
+    Writes an object ``{"messages": [...], "tools": [...]}`` so the host-side
+    reader can access both the message history and the tool schema in one file.
 
     Runs inside the sandbox as user ``agent``; any failure is swallowed so a
     trace problem never aborts an otherwise-complete run.
     """
     try:
-        payload = events_to_trajectory(events)
+        messages = events_to_trajectory(events)
+        tools = tools_to_trajectory(events, initial_tools or [])
+        payload = {"messages": messages, "tools": tools}
         directory = os.path.dirname(path) or "."
         fd, tmp = tempfile.mkstemp(dir=directory, prefix=".oh_traj_", suffix=".tmp")
         try:
@@ -225,7 +256,7 @@ def main(config_path: str) -> int:
         conv.run()
     trajectory_path = cfg.get("trajectory_path")
     if trajectory_path:
-        write_trajectory(trajectory_path, conv.state.events)
+        write_trajectory(trajectory_path, conv.state.events, agent.tools)
     return 0
 
 

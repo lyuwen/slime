@@ -107,23 +107,70 @@ def test_events_to_trajectory_converts_and_flags_reasoning(monkeypatch):
     assert out == [{"role": "assistant", "content": "hi"}]
 
 
+def test_tools_to_trajectory_prefers_system_prompt_event_tools(monkeypatch):
+    import types
+
+    class ToolDefinition:
+        def __init__(self, name):
+            self.name = name
+
+        def to_openai_tool(self):
+            return {"type": "function", "function": {"name": self.name}}
+
+    class SystemPromptEvent:
+        def __init__(self, tools):
+            self.tools = tools
+
+    monkeypatch.setitem(sys.modules, "openhands.sdk.event", types.SimpleNamespace(SystemPromptEvent=SystemPromptEvent))
+    monkeypatch.setitem(sys.modules, "openhands.sdk.tool", types.SimpleNamespace(ToolDefinition=ToolDefinition))
+    event_tools = [ToolDefinition("builtin"), object()]
+    initial_tools = [ToolDefinition("initial")]
+    assert oh_driver.tools_to_trajectory([SystemPromptEvent(event_tools)], initial_tools) == [
+        {"type": "function", "function": {"name": "builtin"}}
+    ]
+
+
+def test_tools_to_trajectory_falls_back_to_initial_tool_definitions(monkeypatch):
+    import types
+
+    class ToolDefinition:
+        def __init__(self, name):
+            self.name = name
+
+        def to_openai_tool(self):
+            return {"type": "function", "function": {"name": self.name}}
+
+    monkeypatch.setitem(sys.modules, "openhands.sdk.event", types.SimpleNamespace(SystemPromptEvent=type("S", (), {})))
+    monkeypatch.setitem(sys.modules, "openhands.sdk.tool", types.SimpleNamespace(ToolDefinition=ToolDefinition))
+    assert oh_driver.tools_to_trajectory([], [ToolDefinition("initial"), object()]) == [
+        {"type": "function", "function": {"name": "initial"}}
+    ]
+
+
 def test_write_trajectory_atomic_and_best_effort(tmp_path, monkeypatch):
     monkeypatch.setattr(oh_driver, "events_to_trajectory", lambda evs: [{"role": "user", "content": "x"}])
+    monkeypatch.setattr(oh_driver, "tools_to_trajectory", lambda evs, tools: [{"type": "function"}])
     dest = tmp_path / "oh_trajectory.json"
-    oh_driver.write_trajectory(str(dest), [object()])
-    assert json.loads(dest.read_text()) == [{"role": "user", "content": "x"}]
+    oh_driver.write_trajectory(str(dest), [object()], [object()])
+    assert json.loads(dest.read_text()) == {
+        "messages": [{"role": "user", "content": "x"}],
+        "tools": [{"type": "function"}],
+    }
     assert list(tmp_path.glob(".oh_traj_*.tmp")) == []
 
     # os.replace failure is swallowed, leaves the prior file intact, and cleans the temp sibling
     monkeypatch.setattr(oh_driver.os, "replace", lambda *args: (_ for _ in ()).throw(OSError("replace failed")))
-    oh_driver.write_trajectory(str(dest), [object()])
-    assert json.loads(dest.read_text()) == [{"role": "user", "content": "x"}]
+    oh_driver.write_trajectory(str(dest), [object()], [object()])
+    assert json.loads(dest.read_text()) == {
+        "messages": [{"role": "user", "content": "x"}],
+        "tools": [{"type": "function"}],
+    }
     assert list(tmp_path.glob(".oh_traj_*.tmp")) == []
     monkeypatch.undo()
 
     # best-effort: a conversion failure must not raise
     monkeypatch.setattr(oh_driver, "events_to_trajectory", lambda evs: (_ for _ in ()).throw(RuntimeError("boom")))
-    oh_driver.write_trajectory(str(dest), [object()])  # no exception
+    oh_driver.write_trajectory(str(dest), [object()], [object()])  # no exception
 
 
 def test_write_trajectory_is_best_effort_when_diagnostic_raises(tmp_path, monkeypatch):

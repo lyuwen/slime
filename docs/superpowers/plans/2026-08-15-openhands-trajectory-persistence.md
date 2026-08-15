@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Persist one enriched OpenHands agent trajectory JSON per coding-agent rollout (messages + diff_text + SWE reward/applied_cleanly) without affecting rollout execution or grading.
+**Goal:** Persist one enriched OpenHands agent trajectory JSON per coding-agent rollout (messages + tools + diff_text + SWE reward/applied_cleanly) without affecting rollout execution or grading.
 
-**Architecture:** `oh_driver.py` (runs as sandbox user `agent`) converts the live `Conversation` events to chat messages and writes them atomically to a config-supplied sandbox path under `/home/agent/`. `OpenHandsHarness` supplies that path via `oh_config.json`. `generate.py` reads the sandbox JSON while the sandbox is alive (right after `git_diff`), enriches it with grading results after evaluation, and atomically writes the final JSON under `SWE_TRAJECTORY_DIR`. All persistence is best-effort.
+**Architecture:** `oh_driver.py` (runs as sandbox user `agent`) converts the live `Conversation` events to chat messages + tool definitions and writes them atomically as `{"messages": [...], "tools": [...]}` to a config-supplied sandbox path under `/home/agent/`. `OpenHandsHarness` supplies that path via `oh_config.json`. `generate.py` reads the sandbox JSON object while the sandbox is alive (right after `git_diff`), enriches it with grading results after evaluation, and atomically writes the final JSON under `SWE_TRAJECTORY_DIR`. All persistence is best-effort.
 
 **Tech Stack:** Python 3, OpenHands SDK (`openhands.sdk.event.base.LLMConvertibleEvent`), pytest, existing slime agent test fakes.
 
@@ -26,11 +26,12 @@
 - Test: `tests/test_agent/test_oh_driver.py`
 
 **Interfaces:**
-- Consumes: `conv.state.events` (list of SDK events); `cfg` dict from `oh_config.json`.
+- Consumes: `conv.state.events` (list of SDK events); `agent.tools` (initial Tool list); `cfg` dict from `oh_config.json`.
 - Produces:
   - `oh_driver.events_to_trajectory(events) -> list[dict]` — pure; filters to `LLMConvertibleEvent`, calls `LLMConvertibleEvent.events_to_messages`, returns `to_chat_dict()` per message with `send_reasoning_content=True`.
-  - `oh_driver.write_trajectory(path, events) -> None` — best-effort atomic JSON write of `events_to_trajectory(events)`; swallows all exceptions.
-  - `main()` calls `write_trajectory(cfg["trajectory_path"], conv.state.events)` after the run/fake-user loop when `cfg.get("trajectory_path")` is set.
+  - `oh_driver.tools_to_trajectory(events, initial_tools) -> list[dict]` — pure; scans events for `SystemPromptEvent`, converts `ToolDefinition` entries via `.to_openai_tool()`; falls back to filtering `initial_tools` for `ToolDefinition` instances. Prefers event list because the SDK injects built-in tools there beyond what the caller passes.
+  - `oh_driver.write_trajectory(path, events, initial_tools=None) -> None` — best-effort atomic JSON write of `{"messages": events_to_trajectory(events), "tools": tools_to_trajectory(events, initial_tools)}`; swallows all exceptions. Intermediate format is an object, not a bare list.
+  - `main()` calls `write_trajectory(trajectory_path, conv.state.events, agent.tools)` after the run/fake-user loop when `cfg.get("trajectory_path")` is set.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -244,8 +245,8 @@ git commit -m "feat(oh): advertise sandbox trajectory path via oh_config"
 - Produces (all module-level in `generate.py`):
   - `_trajectory_root() -> str` — returns `SWE_TRAJECTORY_DIR`, defaulting to `"trajectories"` (persistence is always on for the OpenHands path).
   - `_trajectory_final_path(root, base_sample) -> str` — builds `{root}/{grp}/{grp}_{idx}.json`, using `"unknown"` for a `None` id in the path.
-  - `_read_sandbox_trajectory(sb, path) -> list | None` — best-effort: parse JSON from `sb.read_file`; return `None` on empty/malformed.
-  - `_persist_trajectory(root, base_sample, *, messages, diff_text, reward, applied_cleanly, instance_id, session_id, agent_exit_code) -> None` — best-effort atomic write of the enriched document.
+  - `_read_sandbox_trajectory(sb, path) -> dict | None` — best-effort: parse JSON from `sb.read_file`; accept only an object with `messages` (list) and `tools` (list); return `None` on empty/malformed/wrong-shape (bare list, missing key, non-list field).
+  - `_persist_trajectory(root, base_sample, *, messages, tools, diff_text, reward, applied_cleanly, instance_id, session_id, agent_exit_code) -> None` — best-effort atomic write of the enriched document including `tools`.
 
 - [ ] **Step 1: Write the failing test**
 

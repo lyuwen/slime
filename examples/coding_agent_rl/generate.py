@@ -303,7 +303,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         max_context_tokens=state.max_context_len,
     )
     t0 = time.time()
-    traj_messages = None
+    traj_data = None
     try:
         async with asyncio.timeout(CONFIG.rollout_guard_sec):
             async with boot_agent_sandbox(md["image"], instance_id) as sb:
@@ -329,18 +329,19 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 )
                 diff_text = await swe.git_diff(sb, md["workdir"])
                 if AGENT_NAME == "openhands":
-                    traj_messages = await _read_sandbox_trajectory(sb, OpenHandsHarness.trajectory_sandbox_path)
+                    traj_data = await _read_sandbox_trajectory(sb, OpenHandsHarness.trajectory_sandbox_path)
 
             reward, applied_cleanly = await swe.run_evaluation(
                 md,
                 diff_text=diff_text,
                 timeout_sec=CONFIG.eval_timeout_sec,
             )
-            if traj_messages is not None:
+            if traj_data is not None:
                 _persist_trajectory(
                     _trajectory_root(),
                     base_sample,
-                    messages=traj_messages,
+                    messages=traj_data["messages"],
+                    tools=traj_data["tools"],
                     diff_text=diff_text,
                     reward=float(reward),
                     applied_cleanly=bool(applied_cleanly),
@@ -461,8 +462,13 @@ def _warn_trajectory(message: str, *args) -> None:
         pass
 
 
-async def _read_sandbox_trajectory(sb, path: str) -> list | None:
-    """Return the parsed sandbox trajectory list, or None on read/parse failure."""
+async def _read_sandbox_trajectory(sb, path: str) -> dict | None:
+    """Return the parsed sandbox trajectory object, or None on read/parse failure.
+
+    Accepts only an object with ``messages`` (list) and ``tools`` (list).
+    Any other shape — bare list, missing key, or non-list field — is rejected
+    with a warning. All warning failures are swallowed (best-effort).
+    """
     try:
         raw = await sb.read_file(path, user="agent")
     except Exception as error:
@@ -476,9 +482,13 @@ async def _read_sandbox_trajectory(sb, path: str) -> list | None:
     except Exception as error:
         _warn_trajectory("[coding_agent_rl] trajectory read or parse failed for %s: %s", path, error)
         return None
-    if not isinstance(data, list):
+    if (
+        not isinstance(data, dict)
+        or not isinstance(data.get("messages"), list)
+        or not isinstance(data.get("tools"), list)
+    ):
         _warn_trajectory(
-            "[coding_agent_rl] trajectory has unexpected top-level type at %s: %s",
+            "[coding_agent_rl] trajectory has unexpected shape at %s: %s",
             path,
             type(data).__name__,
         )
@@ -491,6 +501,7 @@ def _persist_trajectory(
     sample: Sample,
     *,
     messages: list,
+    tools: list,
     diff_text: str,
     reward: float,
     applied_cleanly: bool,
@@ -505,6 +516,7 @@ def _persist_trajectory(
         os.makedirs(directory, exist_ok=True)
         doc = {
             "messages": messages,
+            "tools": tools,
             "diff_text": diff_text,
             "reward": reward,
             "applied_cleanly": applied_cleanly,

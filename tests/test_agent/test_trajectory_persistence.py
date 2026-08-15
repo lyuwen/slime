@@ -44,6 +44,7 @@ def test_persist_writes_enriched_document(tmp_path):
         str(tmp_path),
         _sample(group_index=1, index=3, session_id="sid"),
         messages=[{"role": "user", "content": "hi"}],
+        tools=[{"type": "function", "function": {"name": "terminal"}}],
         diff_text="diff --git a b",
         reward=1.0,
         applied_cleanly=True,
@@ -53,6 +54,7 @@ def test_persist_writes_enriched_document(tmp_path):
     )
     doc = json.loads((tmp_path / "1" / "1_3.json").read_text())
     assert doc["messages"] == [{"role": "user", "content": "hi"}]
+    assert doc["tools"] == [{"type": "function", "function": {"name": "terminal"}}]
     assert doc["diff_text"] == "diff --git a b"
     assert doc["reward"] == 1.0
     assert doc["applied_cleanly"] is True
@@ -73,6 +75,7 @@ def test_persist_replace_failure_is_best_effort_and_cleans_temp(tmp_path, monkey
         str(tmp_path),
         _sample(),
         messages=[],
+        tools=[],
         diff_text="",
         reward=0.0,
         applied_cleanly=False,
@@ -91,6 +94,7 @@ def test_persist_is_best_effort_on_bad_root(monkeypatch):
         "/root",
         _sample(),
         messages=[],
+        tools=[],
         diff_text="",
         reward=0.0,
         applied_cleanly=False,
@@ -108,6 +112,7 @@ def test_persist_is_best_effort_when_warning_raises(monkeypatch):
         "/root",
         _sample(),
         messages=[],
+        tools=[],
         diff_text="",
         reward=0.0,
         applied_cleanly=False,
@@ -128,15 +133,19 @@ class _FakeSB:
 def test_read_sandbox_trajectory_parses_and_warns_on_garbage(caplog):
     import asyncio
 
-    good = asyncio.run(G._read_sandbox_trajectory(_FakeSB('[{"role":"user"}]'), "/p"))
-    assert good == [{"role": "user"}]
+    payload = {"messages": [{"role": "user"}], "tools": [{"type": "function"}]}
+    good = asyncio.run(G._read_sandbox_trajectory(_FakeSB(json.dumps(payload)), "/p"))
+    assert good == payload
     assert asyncio.run(G._read_sandbox_trajectory(_FakeSB(""), "/p")) is None
     assert asyncio.run(G._read_sandbox_trajectory(_FakeSB("not json"), "/p")) is None
+    assert asyncio.run(G._read_sandbox_trajectory(_FakeSB('[{"role":"user"}]'), "/p")) is None
     assert asyncio.run(G._read_sandbox_trajectory(_FakeSB('{"messages": []}'), "/p")) is None
+    assert asyncio.run(G._read_sandbox_trajectory(_FakeSB('{"messages": {}, "tools": []}'), "/p")) is None
+    assert asyncio.run(G._read_sandbox_trajectory(_FakeSB('{"messages": [], "tools": {}}'), "/p")) is None
     messages = [record.getMessage() for record in caplog.records]
     assert any("empty or missing" in message for message in messages)
     assert any("read or parse failed" in message for message in messages)
-    assert any("unexpected top-level type" in message for message in messages)
+    assert any("unexpected shape" in message for message in messages)
 
 
 def test_read_sandbox_trajectory_is_best_effort_when_warning_raises(monkeypatch):
@@ -147,6 +156,7 @@ def test_read_sandbox_trajectory_is_best_effort_when_warning_raises(monkeypatch)
     assert asyncio.run(G._read_sandbox_trajectory(_FakeSB(""), "/p")) is None
     assert asyncio.run(G._read_sandbox_trajectory(_FakeSB("not json"), "/p")) is None
     assert asyncio.run(G._read_sandbox_trajectory(_FakeSB('{"messages": []}'), "/p")) is None
+    assert asyncio.run(G._read_sandbox_trajectory(_FakeSB('[{"role":"user"}]'), "/p")) is None
 
 
 if __name__ == "__main__":

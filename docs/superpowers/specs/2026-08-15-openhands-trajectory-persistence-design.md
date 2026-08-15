@@ -29,7 +29,8 @@ It will:
 1. Filter `conv.state.events` to `LLMConvertibleEvent` instances.
 2. Convert them with `LLMConvertibleEvent.events_to_messages()` so parallel actions from one LLM response are reconstructed as one assistant message.
 3. Enable reasoning serialization on copied messages and call `to_chat_dict()`.
-4. Serialize an intermediate JSON object containing `messages`.
+4. Extract tool definitions by scanning events for the first `SystemPromptEvent`; convert each `ToolDefinition` via `.to_openai_tool()`. If no `ToolDefinition` is found in any `SystemPromptEvent`, fall back to the initial `tools` list passed to `Agent`. The event list is preferred because the SDK injects built-in/default tools into `SystemPromptEvent` beyond what the caller supplies.
+5. Serialize an intermediate JSON object `{"messages": [...], "tools": [...]}` — not a bare list.
 
 The driver runs as the sandbox `agent` user. The intermediate file is therefore `/home/agent/oh_trajectory.json`, a location owned and writable by that user. The OpenHands harness supplies this path in `oh_config.json` as `trajectory_path`; the driver uses the configured path rather than embedding a second independent path convention.
 
@@ -57,6 +58,7 @@ Each final trace is a JSON object with these fields:
 ```json
 {
   "messages": [],
+  "tools": [],
   "diff_text": "",
   "reward": 0.0,
   "applied_cleanly": false,
@@ -71,6 +73,7 @@ Each final trace is a JSON object with these fields:
 Field semantics:
 
 - `messages`: OpenHands events reconstructed into OpenAI-compatible chat message dictionaries, including tool calls, tool results, reasoning content when available, the initial user prompt, and fake-user nudges.
+- `tools`: OpenAI-format tool definitions extracted from the `SystemPromptEvent` event log (preferred, includes SDK-injected built-in tools), falling back to `ToolDefinition` instances in the initial `Agent(tools=)` list.
 - `diff_text`: the Git diff captured from the task workspace after the agent exits.
 - `reward`: the numeric reward returned by the configured SWE evaluator.
 - `applied_cleanly`: whether the evaluator applied the patch successfully.
@@ -107,11 +110,14 @@ No new abstraction or base class is introduced; the implementation follows the e
 Focused tests will verify:
 
 1. Convertible OpenHands events produce the expected `messages` JSON, including batched tool calls and reasoning-content serialization.
-2. `OpenHandsHarness.write_config()` supplies `/home/agent/oh_trajectory.json` as `trajectory_path`.
-3. The driver writes only beneath `/home/agent/` under its normal `agent` execution context.
-4. A successful sandbox read plus grading creates `${SWE_TRAJECTORY_DIR}/{group_index}/{group_index}_{index}.json` with the complete schema.
-5. Missing and malformed sandbox traces only emit warnings and do not alter rollout results.
-6. Local directory or atomic-write failures only emit warnings and do not alter rollout results.
-7. Existing OpenHands driver and harness tests remain passing.
+2. `tools_to_trajectory()` extracts `ToolDefinition` entries from `SystemPromptEvent` and skips non-`ToolDefinition` entries; falls back to the initial tools list when no `SystemPromptEvent` ToolDefinitions are found.
+3. `write_trajectory()` writes an object `{"messages": [...], "tools": [...]}`, not a bare list.
+4. `OpenHandsHarness.write_config()` supplies `/home/agent/oh_trajectory.json` as `trajectory_path`.
+5. The driver writes only beneath `/home/agent/` under its normal `agent` execution context.
+6. A successful sandbox read plus grading creates `${SWE_TRAJECTORY_DIR}/{group_index}/{group_index}_{index}.json` with the complete schema including `tools`.
+7. `_read_sandbox_trajectory()` accepts only a dict with `messages` and `tools` lists; rejects bare lists, missing keys, and non-list field values.
+8. Missing and malformed sandbox traces only emit warnings and do not alter rollout results.
+9. Local directory or atomic-write failures only emit warnings and do not alter rollout results.
+10. Existing OpenHands driver and harness tests remain passing.
 
 Verification will run the focused unit tests and formatting/lint checks covering modified files. Full GPU training and SWE evaluation are outside the local unit-test scope.
