@@ -16,11 +16,22 @@ SLIME_DIR="${SLIME_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 # Source model architecture (40 layers, MLA, 80 experts, topk 7, softmax routing).
 source "${SLIME_DIR}/scripts/models/021-32B-A4B.sh"
 
+# Params
+export ROLLOUT_BATCH_SIZE=16
+export ROLLOUT_GROUP_SIZE=8
+export GLOBAL_BATCH_SIZE=128
+export ROLLOUT_TP_SIZE=2
+export ROLLOUT_DP_SIZE=1
+export ROLLOUT_EP_SIZE=1
+export ROLLOUT_MEM_UTILIZATION=0.8
+export NUM_EPOCH=1
+export SGLANG_SERVER_CONCURRENCY=4
+
 # ============ model parallelism ============
 # 8-node, 64-GPU run. PP=8 / EP=8 matches run_8xH20.sh 32B section.
 # No CP: MLA + context-parallel interaction needs verification; disable for safety.
-export TP_SIZE="${TP_SIZE:-1}"
-export PP_SIZE="${PP_SIZE:-8}"
+export TP_SIZE="${TP_SIZE:-2}"
+export PP_SIZE="${PP_SIZE:-1}"
 export CP_SIZE="${CP_SIZE:-8}"
 export EP_SIZE="${EP_SIZE:-8}"
 export ETP_SIZE="${ETP_SIZE:-1}"
@@ -52,6 +63,7 @@ echo "======================================================================"
 echo "Training log: ${LOG_FILE}"
 echo "RUN_ROOT=${RUN_ROOT}"
 echo "======================================================================"
+export TENSORBOARD_DIR=${LOG_DIR}/tensorboard
 
 # MODEL_ARGS already populated by the sourced model script above.
 
@@ -69,17 +81,19 @@ ROLLOUT_ARGS=(
    --input-key prompt
    --label-key label
    --metadata-key metadata
-   --num-rollout 100
-   --rollout-batch-size 8
-   --n-samples-per-prompt 8
+   # --num-rollout 100
+   --num-epoch ${NUM_EPOCH}
+   --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
+   --n-samples-per-prompt ${ROLLOUT_GROUP_SIZE}
    --rollout-max-context-len ${MAX_CONTEXT_LEN}
    --rollout-max-response-len ${MAX_GEN_LEN}
    --rollout-temperature 1.0
    --rollout-stop-token-ids 128012
    --num-steps-per-rollout 1
-   --global-batch-size 64
+   --global-batch-size ${GLOBAL_BATCH_SIZE}
    --micro-batch-size 1
    --save-debug-rollout-data "${RUN_ROOT}/rollout_dumps/rollout_{rollout_id}.pt"
+   --rollout-shuffle
 )
 
 PERF_ARGS=(
@@ -133,7 +147,7 @@ SGLANG_ARGS=(
    --sglang-enable-mixed-chunk
    --sglang-enable-cache-report
    --router-policy consistent_hashing
-   --sglang-server-concurrency 16
+   --sglang-server-concurrency ${SGLANG_SERVER_CONCURRENCY}
 )
 
 MISC_ARGS=(
@@ -189,7 +203,7 @@ export ADAPTER_PUBLIC_HOST="${ADAPTER_PUBLIC_HOST:-${MASTER_ADDR:-${MLP_WORKER_0
 export ADAPTER_BIND_HOST="${ADAPTER_BIND_HOST:-0.0.0.0}"
 export ADAPTER_PORT="${ADAPTER_PORT:-18001}"
 
-export SWE_AGENT_TIME_BUDGET_SEC="${SWE_AGENT_TIME_BUDGET_SEC:-1800}"
+export SWE_AGENT_TIME_BUDGET_SEC="${SWE_AGENT_TIME_BUDGET_SEC:-3600}"
 export SWE_EVAL_TIMEOUT_SEC="${SWE_EVAL_TIMEOUT_SEC:-600}"
 export SWE_BOOT_CONCURRENCY="${SWE_BOOT_CONCURRENCY:-16}"
 
@@ -214,6 +228,7 @@ keys = (
     "no_proxy", "NO_PROXY",
     "E2B_DOMAIN", "E2B_API_KEY", "ADAPTER_PUBLIC_HOST",
     "ADAPTER_BIND_HOST", "ADAPTER_PORT",
+    "TENSORBOARD_DIR",
 )
 env = {k: os.environ[k] for k in keys if k in os.environ}
 # Prefix pass-through: forward every slime / SWE knob automatically so new vars
