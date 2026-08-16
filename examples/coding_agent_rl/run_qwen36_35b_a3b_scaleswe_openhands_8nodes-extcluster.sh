@@ -229,7 +229,7 @@ export SLIME_SANDBOX_TEMPLATE="${SLIME_SANDBOX_TEMPLATE:-swe-openhands}"
 export SWE_OH_FAKE_USER="${SWE_OH_FAKE_USER:-0}"
 export SWE_OH_MAX_ITERATIONS="${SWE_OH_MAX_ITERATIONS:-100}"
 export SWE_OH_TOOLS="${SWE_OH_TOOLS:-file_editor,terminal,task_tracker,think,finish}"
-export SWE_PROMPT_TEMPLATE_PATH="${PWD}/prompt-template.j2"
+export SWE_PROMPT_TEMPLATE_PATH="${SCRIPT_DIR}/prompt-template.j2"
 export SWE_TRAJECTORY_DIR="${RUN_ROOT}/trajectories"
 # Arbitrary extra env vars forwarded verbatim into the OH agent's shell (JSON obj).
 # export SLIME_AGENT_OH_EXTRA_ENVS='{"HTTPS_PROXY":"http://proxy:8080"}'
@@ -291,7 +291,6 @@ PY
 
 ray job submit --address="${RAY_API_SERVER_ADDRESS:-http://127.0.0.1:8265}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   --working-dir="${RUN_ROOT}" \
    -- python3 -u "${SLIME_DIR}/train.py" \
    --actor-num-nodes "${ACTOR_NUM_NODES}" \
    --actor-num-gpus-per-node "${ACTOR_NUM_GPUS_PER_NODE}" \
