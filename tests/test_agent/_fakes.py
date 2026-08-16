@@ -64,6 +64,7 @@ class FakeTokenizer:
         # decoded reply text (mirrors the historic ToyTokenizer.outputs pattern).
         self._outputs = dict(outputs or {})
         self.rendered: list[tuple[list[dict], list[dict] | None]] = []
+        self.render_kwargs: list[dict] = []
 
     def _id(self, word: str) -> int:
         if word not in self._vocab:
@@ -99,8 +100,9 @@ class FakeTokenizer:
             parts.append(f"toolcall:{fn.get('name', '')}")
         return " ".join(p for p in parts if p)
 
-    def apply_chat_template(self, messages, tools=None, tokenize=True, add_generation_prompt=True):
+    def apply_chat_template(self, messages, tools=None, tokenize=True, add_generation_prompt=True, **kwargs):
         self.rendered.append((list(messages), tools))
+        self.render_kwargs.append(dict(kwargs))
         out: list[int] = []
         for m in messages:
             role = m.get("role", "user")
@@ -301,7 +303,7 @@ def _as_str(v: str | bytes) -> str:
 def _done_path_from_launch(cmd: str) -> str | None:
     """Recover the exit-code marker path from a ``setsid bash {launcher}`` command
     so the subsequent poll matches. ``sandbox.exec_and_wait`` names the launcher
-    ``/tmp/.{tag}.sh`` and its sibling marker ``/tmp/.{tag}.done``."""
+    ``/tmp/.{tag}-{uuid}.sh`` and its sibling marker ``/tmp/.{tag}-{uuid}.done``."""
     m = re.search(r"setsid bash (\S+)\.sh\b", cmd)
     if m:
         return f"{m.group(1)}.done"

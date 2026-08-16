@@ -61,6 +61,7 @@ def _render_token_ids(
     *,
     tools: list[dict] | None,
     add_generation_prompt: bool = True,
+    chat_template_kwargs: dict | None = None,
 ) -> list[int]:
     """Render a chat-message list to token ids with the served chat template."""
     enc = tokenizer.apply_chat_template(
@@ -68,6 +69,7 @@ def _render_token_ids(
         tools=tools,
         tokenize=True,
         add_generation_prompt=add_generation_prompt,
+        **(chat_template_kwargs or {}),
     )
     ids = enc["input_ids"] if hasattr(enc, "__getitem__") and "input_ids" in enc else enc
     return list(ids)
@@ -147,12 +149,14 @@ class BaseAdapter:
         reasoning_parser=None,
         max_turns_per_sid: int | None = None,
         fork_threshold_tokens: int | None = None,
+        chat_template_kwargs: dict | None = None,
         debug_callback: Callable[..., None] | None = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.sglang_url = sglang_url.rstrip("/") if isinstance(sglang_url, str) else sglang_url
         self.tool_parser = tool_parser
         self.reasoning_parser = reasoning_parser
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
         self.store: dict[str, Any] = {}
         self.inflight: dict[str, set[asyncio.Task]] = {}
         self.closed: set[str] = set()
@@ -339,7 +343,13 @@ class BaseAdapter:
         t0 = time.monotonic()
         try:
             translated, tools_schema = self._translate(body)
-            prompt_ids = _render_token_ids(translated, tok, tools=tools_schema, add_generation_prompt=True)
+            prompt_ids = _render_token_ids(
+                translated,
+                tok,
+                tools=tools_schema,
+                add_generation_prompt=True,
+                chat_template_kwargs=self.chat_template_kwargs,
+            )
 
             turn = await call_sglang_generate(prompt_ids, s, body, adapter=self, session_id=sid)
 
@@ -414,12 +424,13 @@ def sid_from_body(body: dict | None) -> str | None:
 
 
 def _sampling_params(session: Any, body: dict, *, max_token_keys: tuple[str, ...], stop_keys: tuple[str, ...]) -> dict:
+    defaults = session.sampling_defaults or {}
     sp: dict[str, Any] = {
         "skip_special_tokens": False,
         "spaces_between_special_tokens": False,
         "no_stop_trim": True,
         "max_new_tokens": 4096,
-        **(session.sampling_defaults or {}),
+        **defaults,
     }
 
     for key in max_token_keys:
@@ -427,8 +438,14 @@ def _sampling_params(session: Any, body: dict, *, max_token_keys: tuple[str, ...
             sp["max_new_tokens"] = min(int(sp.get("max_new_tokens", body[key])), int(body[key]))
             break
 
+    # The rollout manager's sampling defaults are authoritative for on-policy RL:
+    # a key it set wins over whatever the agent sends. This matters because some
+    # agent SDKs (e.g. OpenHands' LLM) force temperature/top_p into every request
+    # body and cannot be told to omit them, which would otherwise silently
+    # override the configured rollout distribution. Body values still apply for
+    # keys the manager left unset (the CLI harnesses send none of these).
     for src_k, dst_k in (("temperature", "temperature"), ("top_p", "top_p"), ("top_k", "top_k")):
-        if src_k in body:
+        if src_k in body and dst_k not in defaults:
             sp[dst_k] = body[src_k]
 
     for key in stop_keys:

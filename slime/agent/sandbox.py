@@ -14,10 +14,30 @@ import logging
 import os
 import random
 import time
+import uuid
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
+
+_e2b_patched = False
+
+
+def _ensure_e2b_patched() -> None:
+    """Apply the kruise e2b patch once, lazily.
+
+    ``patch_e2b`` imports ``e2b`` at import time, so it must not run at module
+    load: the CPU test suite imports this module without e2b installed. Deferring
+    to the first sandbox creation keeps the import edge inside the e2b-only path.
+    """
+    global _e2b_patched
+    if _e2b_patched:
+        return
+    from .patch_e2b import patch_e2b
+
+    patch_e2b(https=False, validate_key=False)
+    _e2b_patched = True
+    logger.info("E2B sandbox patched")
 
 
 ExecResult = tuple[int, str, str]
@@ -102,10 +122,17 @@ async def exec_and_wait(
     ``_await_done_marker``) -- none of which depend on a stream staying alive,
     and the polling doubles as an idle-GC keepalive while the command runs.
     """
-    out_file = out_file or f"/tmp/.{tag}.out"
-    done_file = f"/tmp/.{tag}.done"
-    launcher = f"/tmp/.{tag}.sh"
-    lock_dir = f"/tmp/.{tag}.spawned"
+    # Per-call unique base for the launcher/marker/lock/out paths. A fixed
+    # /tmp/.{tag}.* collides across runs: if the path already exists owned by a
+    # different user (baked into the image, or left by a prior run in a recycled
+    # sandbox), the next user's write_file cannot reopen it and the gateway
+    # returns "open /tmp/.run.sh: permission denied". The uuid keeps tag in the
+    # name for debuggability while guaranteeing a fresh, unowned path each call.
+    slug = f"{tag}-{uuid.uuid4().hex[:12]}"
+    out_file = out_file or f"/tmp/.{slug}.out"
+    done_file = f"/tmp/.{slug}.done"
+    launcher = f"/tmp/.{slug}.sh"
+    lock_dir = f"/tmp/.{slug}.spawned"
     prefix = f"cd {workdir}\nexport HOME=/home/{user}\n" if workdir else ""
     launcher_body = f"#!/bin/bash\n{prefix}{cmd}\necho $? > {done_file}\n"
     await sb.write_file(launcher, launcher_body, user=user)
@@ -149,10 +176,12 @@ class E2BSandbox:
     lifetime_sec_env = ("SLIME_AGENT_SANDBOX_LIFETIME_SEC", "SWE_SANDBOX_LIFETIME_SEC")
     rpc_retries_env = ("SLIME_AGENT_SANDBOX_RPC_RETRIES", "SWE_RPC_RETRIES")
     size_env = ("SLIME_AGENT_E2B_SANDBOX_SIZE", "SWE_E2B_SANDBOX_SIZE")
+    template_env = ("SLIME_SANDBOX_TEMPLATE",)
 
     default_lifetime_sec = 3600
     default_rpc_retries = 6
     default_size = "md"
+    default_template = "swe-openhands"
     rpc_backoff_base_sec = 1.0
     rpc_backoff_cap_sec = 32.0
 
@@ -164,12 +193,14 @@ class E2BSandbox:
         image_metadata_key: str | None = None,
         rpc_retries: int | None = None,
         size: str | None = None,
+        template: str | None = None,
     ) -> None:
         self.image = image
         self.timeout = timeout if timeout is not None else self._lifetime_sec_from_env()
         self.image_metadata_key = image_metadata_key or self._image_metadata_key_from_env()
         self.rpc_retries = rpc_retries if rpc_retries is not None else self._rpc_retries_from_env()
         self.size = size if size is not None else self._size_from_env()
+        self.template = template if template is not None else self._template_from_env()
         self._sb = None
         self.sandbox_id = ""
 
@@ -189,6 +220,10 @@ class E2BSandbox:
     def _size_from_env(cls) -> str:
         return _getenv(*cls.size_env, default=cls.default_size)
 
+    @classmethod
+    def _template_from_env(cls) -> str:
+        return _getenv(*cls.template_env, default=cls.default_template)
+
     # Transient client-side failures safe to retry.
     _TRANSIENT_RPC_ERRORS = frozenset(
         {
@@ -203,6 +238,8 @@ class E2BSandbox:
             "PoolTimeout",
             "RemoteProtocolError",
             "SSLError",
+            #  Kruise/E2B may temporarily report: "healthy sandbox <id> not found"
+            "TimeoutException",
         }
     )
 
@@ -271,16 +308,32 @@ class E2BSandbox:
                 "The legacy SWE_SANDBOX_IMAGE_METADATA_KEY name is also "
                 "accepted for coding-agent examples."
             )
+        _ensure_e2b_patched()
+
         from e2b import AsyncSandbox  # type: ignore
 
-        md = {self.image_metadata_key: self.image}
+        md = {
+            self.image_metadata_key: self.image,
+            # Provisioning timeouts
+            "e2b.agents.kruise.io/claim-timeout-seconds": "180",
+            "e2b.agents.kruise.io/wait-ready-timeout-seconds": "120",
+            # Useful identifiers
+            "label:swe-instance-id": self.image.rsplit("/", 1)[-1].replace(":", "___"),
+            # During debugging only
+            "e2b.agents.kruise.io/reserve-failed-sandbox-for": "10m",
+        }
 
-        if self.size:
+        if False:  # self.size:
             prefix = self.image_metadata_key.rsplit("/", 1)[0] if "/" in self.image_metadata_key else ""
             size_key = f"{prefix}/size" if prefix else "size"
             md[size_key] = self.size
 
-        self._sb = await self._rpc_retry("create", lambda: AsyncSandbox.create(timeout=self.timeout, metadata=md))
+        self._sb = await self._rpc_retry(
+            "create",
+            lambda: AsyncSandbox.create(
+                template=self.template, timeout=self.timeout, request_timeout=300, metadata=md
+            ),
+        )
         self.sandbox_id = self._sb.sandbox_id
         return self
 
@@ -376,7 +429,7 @@ async def ensure_agent_user(sb: Sandbox, workdir: str) -> None:
     """Create the unprivileged 'agent' user that owns workdir + can git diff."""
     await sb.exec(
         f"id agent >/dev/null 2>&1 || useradd -m -s /bin/bash agent && "
-        f"chown -R agent:agent /home/agent {workdir} && "
+        f"mkdir -p {workdir} && chown -R agent:agent /home/agent {workdir} && "
         f"git config --system --add safe.directory '*' && id agent",
         user="root",
         check=True,

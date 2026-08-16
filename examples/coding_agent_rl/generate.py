@@ -18,20 +18,25 @@ and produces the md dict consumed below.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import random
 import secrets
+import tempfile
 import time
 import traceback
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+from jinja2 import Environment, FileSystemLoader, TemplateError
 
 from slime.agent.adapters import AnthropicAdapter, OpenAIAdapter
 from slime.agent.aiohttp_threaded import FilteredAccessLogger, run_app_in_thread
-from slime.agent.harness import ClaudeCodeHarness, CodexHarness
+from slime.agent.harness import ClaudeCodeHarness, CodexHarness, OpenHandsHarness
 from slime.agent.sandbox import E2BSandbox
 from slime.utils.misc import SingletonMeta
 from slime.utils.processing_utils import load_tokenizer
@@ -45,6 +50,7 @@ logging.getLogger("e2b").setLevel(logging.WARNING)
 _AGENTS = {
     "claude_code": (ClaudeCodeHarness, AnthropicAdapter),
     "codex": (CodexHarness, OpenAIAdapter),
+    "openhands": (OpenHandsHarness, OpenAIAdapter),
 }
 AGENT_NAME = os.environ.get("SWE_AGENT", "claude_code")
 if AGENT_NAME not in _AGENTS:
@@ -65,6 +71,10 @@ class SweConfig:
     rollout_guard_sec: int
     boot_concurrency: int
     boot_retries: int
+    oh_fake_user: bool
+    oh_max_iterations: int
+    oh_tools: list[str]
+    oh_extra_envs: dict[str, str]
 
     @classmethod
     def from_env(cls) -> SweConfig:
@@ -72,6 +82,12 @@ class SweConfig:
         eval_timeout = int(os.environ.get("SWE_EVAL_TIMEOUT_SEC", "600"))
         guard = int(os.environ.get("SWE_ROLLOUT_GUARD_SEC", "0") or 0) or (agent_time_budget + eval_timeout + 180)
         fork = int(v) if (v := os.environ.get("SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS")) else None
+        oh_tools_raw = os.environ.get("SWE_OH_TOOLS", "file_editor,terminal,task_tracker,think,finish")
+        oh_tools = [t.strip() for t in oh_tools_raw.split(",") if t.strip()]
+        oh_extra_envs_raw = os.environ.get("SLIME_AGENT_OH_EXTRA_ENVS", "").strip()
+        oh_extra_envs = json.loads(oh_extra_envs_raw) if oh_extra_envs_raw else {}
+        if not isinstance(oh_extra_envs, dict):
+            raise ValueError("SLIME_AGENT_OH_EXTRA_ENVS must be a JSON object")
         return cls(
             eval_protocol=os.environ.get("SWE_EVAL_PROTOCOL", swe.PROTOCOL_SCALESWE),
             train_protocol=os.environ.get("SWE_TRAIN_PROTOCOL", swe.PROTOCOL_SCALESWE),
@@ -84,10 +100,89 @@ class SweConfig:
             rollout_guard_sec=guard,
             boot_concurrency=int(os.environ.get("SWE_BOOT_CONCURRENCY", "16")),
             boot_retries=int(os.environ.get("SWE_BOOT_RETRIES", "2")),
+            oh_fake_user=os.environ.get("SWE_OH_FAKE_USER", "0") not in ("0", "", "false", "False"),
+            oh_max_iterations=int(os.environ.get("SWE_OH_MAX_ITERATIONS", "100")),
+            oh_tools=oh_tools,
+            oh_extra_envs=oh_extra_envs,
         )
 
 
 CONFIG = SweConfig.from_env()
+
+
+def get_prompt(md: dict) -> str:
+    """Generate the agent prompt, optionally using a Jinja2 template.
+
+    If SWE_PROMPT_TEMPLATE_PATH is set, loads and renders that template
+    with the metadata dict. Otherwise falls back to the hardcoded SWE_PROMPT.
+
+    Args:
+        md: Metadata dict from swe.get_metadata(), containing:
+            - problem_statement: The task description
+            - workdir: Repository path in the sandbox
+            - instance_id: Unique identifier
+            - image: Docker image name
+            - protocol: Evaluation protocol
+
+    Returns:
+        Rendered prompt string to pass to the harness
+    """
+    template_path_str = os.environ.get("SWE_PROMPT_TEMPLATE_PATH", "").strip()
+
+    if not template_path_str:
+        return swe.SWE_PROMPT
+
+    template_path = Path(template_path_str)
+
+    try:
+        # Load template
+        if not template_path.exists():
+            logger.warning(
+                "[coding_agent_rl] Template file not found: %s; falling back to SWE_PROMPT",
+                template_path,
+            )
+            return swe.SWE_PROMPT
+
+        # Set up Jinja2 environment
+        template_dir = template_path.parent
+        template_name = template_path.name
+        env = Environment(loader=FileSystemLoader(str(template_dir)))
+        template = env.get_template(template_name)
+
+        # Build context with instance alias for legacy.j2 compatibility
+        context = {
+            "instance": {
+                "problem_statement": md.get("problem_statement", ""),
+                "repo_path": md.get("workdir", ""),
+                "workdir": md.get("workdir", ""),
+                "instance_id": md.get("instance_id", ""),
+                "image": md.get("image", ""),
+            },
+            "md": md,
+        }
+
+        # Render template
+        rendered = template.render(context)
+        logger.info("[coding_agent_rl] Using template prompt from %s", template_path)
+        return rendered
+
+    except TemplateError as e:
+        logger.error(
+            "[coding_agent_rl] Template rendering failed (%s): %s: %s; falling back to SWE_PROMPT",
+            template_path,
+            type(e).__name__,
+            str(e),
+        )
+        return swe.SWE_PROMPT
+    except Exception as e:
+        logger.error(
+            "[coding_agent_rl] Unexpected error loading template (%s): %s: %s; falling back to SWE_PROMPT",
+            template_path,
+            type(e).__name__,
+            str(e),
+        )
+        return swe.SWE_PROMPT
+
 
 _BOOT_SEM = asyncio.Semaphore(CONFIG.boot_concurrency)
 
@@ -108,6 +203,15 @@ async def boot_agent_sandbox(image: str, instance_id: str) -> AsyncIterator[E2BS
             async with _BOOT_SEM:
                 await cand.__aenter__()
                 try:
+                    # Temporary sanitation for recycled Kruise sandboxes.
+                    # Remove transient state potentially left by a previous claimant.
+                    await cand.exec(
+                        "rm -f /tmp/.run.sh /tmp/.run-*.sh /etc/gitconfig.lock; chmod 1777 /tmp",
+                        user="root",
+                        check=True,
+                        timeout=30,
+                    )
+
                     await HARNESS_CLS().install_cli(cand)
                 except BaseException:
                     await cand.__aexit__(None, None, None)
@@ -153,6 +257,7 @@ class _AdapterService(metaclass=SingletonMeta):
             tool_parser=self.tool_parser,
             reasoning_parser=self.reasoning_parser,
             fork_threshold_tokens=CONFIG.fork_merge_threshold,
+            chat_template_kwargs=getattr(args, "apply_chat_template_kwargs", None),
         )
         # handler_cancellation=True so a client disconnect cancels the handler
         # coroutine, arming the fire-and-forget /abort_request in the adapter.
@@ -198,25 +303,52 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         max_context_tokens=state.max_context_len,
     )
     t0 = time.time()
+    traj_data = None
     try:
         async with asyncio.timeout(CONFIG.rollout_guard_sec):
             async with boot_agent_sandbox(md["image"], instance_id) as sb:
                 await swe.prepare_workspace(sb, md["workdir"], md)
+                oh_kwargs = (
+                    {
+                        "fake_user": CONFIG.oh_fake_user,
+                        "max_iterations": CONFIG.oh_max_iterations,
+                        "tools": CONFIG.oh_tools,
+                        "extra_envs": CONFIG.oh_extra_envs,
+                    }
+                    if AGENT_NAME == "openhands"
+                    else {}
+                )
                 agent_exit_code = await HARNESS_CLS().run(
                     sb,
                     workdir=md["workdir"],
                     session_id=session_id,
                     adapter_url=state.adapter_url,
                     time_budget_sec=CONFIG.agent_time_budget_sec,
-                    prompt=swe.SWE_PROMPT,
+                    prompt=get_prompt(md),
+                    **oh_kwargs,
                 )
                 diff_text = await swe.git_diff(sb, md["workdir"])
+                if AGENT_NAME == "openhands":
+                    traj_data = await _read_sandbox_trajectory(sb, OpenHandsHarness.trajectory_sandbox_path)
 
             reward, applied_cleanly = await swe.run_evaluation(
                 md,
                 diff_text=diff_text,
                 timeout_sec=CONFIG.eval_timeout_sec,
             )
+            if traj_data is not None:
+                _persist_trajectory(
+                    _trajectory_root(),
+                    base_sample,
+                    messages=traj_data["messages"],
+                    tools=traj_data["tools"],
+                    diff_text=diff_text,
+                    reward=float(reward),
+                    applied_cleanly=bool(applied_cleanly),
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    agent_exit_code=agent_exit_code,
+                )
             if evaluation:
                 logger.info(
                     "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs (eval-only)",
@@ -311,6 +443,99 @@ def _session_id(sample: Sample, instance_id: str) -> str:
     if sample.index is not None and sample.group_index is not None:
         return f"cagent-{instance_id}-{sample.index}-{sample.group_index}"
     return f"cagent-{instance_id}-{secrets.token_hex(8)}"
+
+
+def _trajectory_root() -> str:
+    return os.environ.get("SWE_TRAJECTORY_DIR", "trajectories")
+
+
+def _trajectory_final_path(root: str, sample: Sample) -> str:
+    group_index = "unknown" if sample.group_index is None else str(sample.group_index)
+    index = "unknown" if sample.index is None else str(sample.index)
+    return os.path.join(root, group_index, f"{group_index}_{index}.json")
+
+
+def _warn_trajectory(message: str, *args) -> None:
+    try:
+        logger.warning(message, *args)
+    except Exception:
+        pass
+
+
+async def _read_sandbox_trajectory(sb, path: str) -> dict | None:
+    """Return the parsed sandbox trajectory object, or None on read/parse failure.
+
+    Accepts only an object with ``messages`` (list) and ``tools`` (list).
+    Any other shape — bare list, missing key, or non-list field — is rejected
+    with a warning. All warning failures are swallowed (best-effort).
+    """
+    try:
+        raw = await sb.read_file(path, user="agent")
+    except Exception as error:
+        _warn_trajectory("[coding_agent_rl] trajectory read failed for %s: %s", path, error)
+        return None
+    if not raw:
+        _warn_trajectory("[coding_agent_rl] trajectory content empty or missing at %s", path)
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception as error:
+        _warn_trajectory("[coding_agent_rl] trajectory read or parse failed for %s: %s", path, error)
+        return None
+    if (
+        not isinstance(data, dict)
+        or not isinstance(data.get("messages"), list)
+        or not isinstance(data.get("tools"), list)
+    ):
+        _warn_trajectory(
+            "[coding_agent_rl] trajectory has unexpected shape at %s: %s",
+            path,
+            type(data).__name__,
+        )
+        return None
+    return data
+
+
+def _persist_trajectory(
+    root: str,
+    sample: Sample,
+    *,
+    messages: list,
+    tools: list,
+    diff_text: str,
+    reward: float,
+    applied_cleanly: bool,
+    instance_id: str,
+    session_id: str,
+    agent_exit_code: int | None,
+) -> None:
+    """Best-effort atomic write of the enriched trajectory document."""
+    try:
+        path = _trajectory_final_path(root, sample)
+        directory = os.path.dirname(path)
+        os.makedirs(directory, exist_ok=True)
+        doc = {
+            "messages": messages,
+            "tools": tools,
+            "diff_text": diff_text,
+            "reward": reward,
+            "applied_cleanly": applied_cleanly,
+            "instance_id": instance_id,
+            "group_index": sample.group_index,
+            "index": sample.index,
+            "session_id": session_id,
+            "agent_exit_code": agent_exit_code,
+        }
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".traj_", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as file:
+                json.dump(doc, file)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+    except Exception as error:
+        _warn_trajectory("[coding_agent_rl] %s: trajectory persist skipped: %s", instance_id, error)
 
 
 def _abort_result(sample: Sample, reason: str, instance_id: str) -> list[Sample]:
