@@ -10,6 +10,11 @@ effect):
     official make_test_spec + get_eval_report so each repo uses its own
     test_cmd and log parser.
 
+A third selector, "auto", makes the choice per-sample from the row's own shape
+(see ``detect_protocol``) so a single dataset may interleave scaleswe and
+swebench rows. This is the only way to grade both formats in one run; the two
+graders and metadata parsers are otherwise fully independent.
+
 The only thing that varies by protocol is the dataset schema and how a
 diff is scored. Everything sandbox-side (prepare_workspace / git_diff /
 apply_diff / pre_commands) is shared and lives here once.
@@ -51,6 +56,7 @@ logger = logging.getLogger(__name__)
 
 PROTOCOL_SCALESWE = "scaleswe"
 PROTOCOL_SWEBENCH = "swebench"
+PROTOCOL_AUTO = "auto"  # per-sample detection; lets one dataset mix both shapes
 
 # Paths inside the sandbox (avoid clashes with image-shipped paths).
 _PATCH = "/workspace/__cagent_patch__.diff"
@@ -74,7 +80,27 @@ class EvalResult(NamedTuple):
     applied_cleanly: bool
 
 
+def detect_protocol(sample: Sample) -> str:
+    """Infer a row's grading protocol from its own shape.
+
+    A row is scaleswe when it carries any scaleswe grading field
+    (``swepro`` / ``eval_cmd`` / ``f2p_script``); otherwise, if it carries a
+    swebench ``test_patch``, it is swebench. Defaults to scaleswe when neither
+    signal is present so an underspecified row is rejected by the scaleswe
+    ``evaluability_check`` rather than mis-routed to the swebench grader.
+    """
+    m = sample.metadata or {}
+    rem = m.get("remote_env_info") or {}
+    if m.get("swepro") or m.get("eval_cmd") or rem.get("f2p_script"):
+        return PROTOCOL_SCALESWE
+    if (rem.get("test_patch") or "").strip():
+        return PROTOCOL_SWEBENCH
+    return PROTOCOL_SCALESWE
+
+
 def get_metadata(sample: Sample, protocol: str = PROTOCOL_SCALESWE) -> dict[str, Any]:
+    if protocol == PROTOCOL_AUTO:
+        protocol = detect_protocol(sample)
     if protocol == PROTOCOL_SWEBENCH:
         return _metadata_swebench(sample)
     return _metadata_scaleswe(sample)
