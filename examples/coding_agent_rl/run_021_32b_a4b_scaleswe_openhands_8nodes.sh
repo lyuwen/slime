@@ -32,7 +32,7 @@ ROLLOUT_EP_SIZE="${ROLLOUT_EP_SIZE:-8}"
 ROLLOUT_MEM_UTILIZATION="${ROLLOUT_MEM_UTILIZATION:-0.75}"
 
 # ============ context length ============
-MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-96000}"
+MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-131072}"
 MAX_GEN_LEN="${MAX_GEN_LEN:-32768}"
 
 # ============ paths — override before launching ============
@@ -72,10 +72,6 @@ ROLLOUT_ARGS=(
    --rollout-max-context-len ${MAX_CONTEXT_LEN}
    --rollout-max-response-len ${MAX_GEN_LEN}
    --rollout-temperature 1.0
-   # DeepSeek-V3-0321 32B-A4B tiktoken vocab (128256). The chat template ends
-   # every assistant turn with <|im_end|> and tokenizer_config sets
-   # eos_token=<|im_end|>=128012, so that is the turn terminator (NOT
-   # <|end_of_text|>=128001). Adjust if your checkpoint uses a different tokenizer.
    --rollout-stop-token-ids 128012
    --num-steps-per-rollout 1
    --global-batch-size 64
@@ -129,9 +125,10 @@ SGLANG_ARGS=(
    --sglang-ep-size ${ROLLOUT_EP_SIZE}
    --sglang-enable-dp-lm-head
    --sglang-moe-dense-tp-size 1
-   # No --sglang-tool-call-parser / --sglang-reasoning-parser: DeepSeek-V3-0321
-   # does not use a special reasoning format or coder-mode tool-call parser.
-   # Add --sglang-tool-call-parser deepseek_v3 if your sglang build supports it.
+   --sglang-enable-mixed-chunk
+   --sglang-tool-call-parser glm47
+   --sglang-reasoning-parser deepseek-r1
+   --sglang-enable-cache-report
 )
 
 MISC_ARGS=(
