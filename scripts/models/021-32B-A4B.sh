@@ -54,8 +54,7 @@ MODEL_ARGS=(
     --moe-shared-expert-intermediate-size $MOE_SHARED_EXPERT_INTERMEDIATE_SIZE
     --moe-router-pre-softmax
     --moe-router-score-function softmax
-    --moe-router-enable-expert-bias
-    --moe-router-load-balancing-type seq_aux_loss
+    --moe-router-load-balancing-type aux_loss
     --moe-token-dispatcher-type alltoall
     --moe-aux-loss-coeff 0
     --moe-router-bias-update-rate 0

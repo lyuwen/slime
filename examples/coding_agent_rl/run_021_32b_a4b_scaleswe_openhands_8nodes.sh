@@ -21,7 +21,7 @@ source "${SLIME_DIR}/scripts/models/021-32B-A4B.sh"
 # No CP: MLA + context-parallel interaction needs verification; disable for safety.
 export TP_SIZE="${TP_SIZE:-1}"
 export PP_SIZE="${PP_SIZE:-8}"
-export CP_SIZE="${CP_SIZE:-1}"
+export CP_SIZE="${CP_SIZE:-8}"
 export EP_SIZE="${EP_SIZE:-8}"
 export ETP_SIZE="${ETP_SIZE:-1}"
 
@@ -58,6 +58,9 @@ echo "======================================================================"
 CKPT_ARGS=(
    --hf-checkpoint "${HF_CHECKPOINT}"
    --ref-load "${REF_MODEL_PATH}"
+   --load "${RUN_ROOT}/checkpoints"
+   --save "${RUN_ROOT}/checkpoints"
+   --save-interval 10
 )
 
 ROLLOUT_ARGS=(
@@ -81,11 +84,11 @@ ROLLOUT_ARGS=(
 
 PERF_ARGS=(
    --tensor-model-parallel-size ${TP_SIZE}
+   --sequence-parallel
    --pipeline-model-parallel-size ${PP_SIZE}
    --context-parallel-size ${CP_SIZE}
    --expert-model-parallel-size ${EP_SIZE}
    --expert-tensor-parallel-size ${ETP_SIZE}
-   --sequence-parallel
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
@@ -125,10 +128,12 @@ SGLANG_ARGS=(
    --sglang-ep-size ${ROLLOUT_EP_SIZE}
    --sglang-enable-dp-lm-head
    --sglang-moe-dense-tp-size 1
-   --sglang-enable-mixed-chunk
    --sglang-tool-call-parser glm47
    --sglang-reasoning-parser deepseek-r1
+   --sglang-enable-mixed-chunk
    --sglang-enable-cache-report
+   --router-policy consistent_hashing
+   --sglang-server-concurrency 16
 )
 
 MISC_ARGS=(
@@ -141,9 +146,11 @@ MISC_ARGS=(
    --moe-token-dispatcher-type flex
    --moe-enable-deepep
    --colocate
+   --use-tensorboard
 )
 
 # ============ ray cluster network ============
+# Set MASTER_ADDR before the SWE block: ADAPTER_PUBLIC_HOST below falls back to it.
 export MASTER_ADDR="${MASTER_ADDR:-${MLP_WORKER_0_HOST:-$(hostname -I | awk '{print $1}')}}"
 export MASTER_PORT="${MASTER_PORT:-${MLP_WORKER_0_PORT:-6379}}"
 export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-${MLP_SOCKET_IFNAME:-eth0}}"
@@ -166,11 +173,18 @@ export SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY="${SLIME_AGENT_SANDBOX_IMAGE_METAD
 # that mount. Forwarded to workers by the SLIME_/SWE_ prefix loop below.
 export SLIME_SANDBOX_TEMPLATE="${SLIME_SANDBOX_TEMPLATE:-swe-openhands}"
 
+# OpenHands agent knobs.
 export SWE_OH_FAKE_USER="${SWE_OH_FAKE_USER:-0}"
 export SWE_OH_MAX_ITERATIONS="${SWE_OH_MAX_ITERATIONS:-100}"
 export SWE_OH_TOOLS="${SWE_OH_TOOLS:-file_editor,terminal,task_tracker,think,finish}"
+export SWE_PROMPT_TEMPLATE_PATH="${SCRIPT_DIR}/prompt-template.j2"
+export SWE_TRAJECTORY_DIR="${RUN_ROOT}/trajectories"
+# Arbitrary extra env vars forwarded verbatim into the OH agent's shell (JSON obj).
 # export SLIME_AGENT_OH_EXTRA_ENVS='{"HTTPS_PROXY":"http://proxy:8080"}'
+export SLIME_AGENT_OH_EXTRA_ENVS='{"OH_SEND_REASONING_CONTENT":"yes"}'
+# export SLIME_AGENT_OH_EXTRA_ENVS='{"OH_SEND_REASONING_CONTENT":"yes","OH_VALIDATE_TOOLCALL_PARAMS":"on"}'
 
+# ADAPTER_PUBLIC_HOST must be routable from inside the sandbox (not 127.0.0.1).
 export ADAPTER_PUBLIC_HOST="${ADAPTER_PUBLIC_HOST:-${MASTER_ADDR:-${MLP_WORKER_0_HOST:-127.0.0.1}}}"
 export ADAPTER_BIND_HOST="${ADAPTER_BIND_HOST:-0.0.0.0}"
 export ADAPTER_PORT="${ADAPTER_PORT:-18001}"
@@ -203,9 +217,10 @@ keys = (
 )
 env = {k: os.environ[k] for k in keys if k in os.environ}
 # Prefix pass-through: forward every slime / SWE knob automatically so new vars
-# need no per-var edit. Matches bare SLIME_ (not just SLIME_AGENT_) so knobs like
-# SLIME_SANDBOX_TEMPLATE and SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS are not
-# silently dropped; SLIME_AGENT_OH_EXTRA_ENVS rides this rule too.
+# need no per-var edit (see spec §5.1a). Matches bare SLIME_ (not just
+# SLIME_AGENT_) so knobs like SLIME_SANDBOX_TEMPLATE and
+# SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS are not silently dropped;
+# SLIME_AGENT_OH_EXTRA_ENVS rides this rule too.
 for k, v in os.environ.items():
     if k.startswith("SLIME_") or k.startswith("SWE_"):
         env[k] = v
@@ -223,7 +238,6 @@ PY
 
 ray job submit --address="${RAY_API_SERVER_ADDRESS:-http://127.0.0.1:8265}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   --working-dir="${RUN_ROOT}" \
    -- python3 -u "${SLIME_DIR}/train.py" \
    --actor-num-nodes "${ACTOR_NUM_NODES}" \
    --actor-num-gpus-per-node "${ACTOR_NUM_GPUS_PER_NODE}" \
