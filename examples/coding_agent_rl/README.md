@@ -48,6 +48,28 @@ Standard slime JSONL with three keys:
 
 Wire it up with `--input-key prompt --label-key label --metadata-key metadata`.
 
+### Mixing scaleswe and swebench rows in one dataset
+
+A single JSONL may interleave both formats. Set `SWE_TRAIN_PROTOCOL=auto` (and/or
+`SWE_EVAL_PROTOCOL=auto`) and each row is routed per-sample from its own shape: a
+row carrying `swepro` / `eval_cmd` / `metadata.remote_env_info.f2p_script` grades
+as scaleswe; a row carrying `metadata.remote_env_info.test_patch` (and no
+scaleswe grader) grades as swebench. This works because slime loads JSONL
+per-line and treats each row's `metadata` independently — there is no cross-row
+schema unification, so heterogeneous scaleswe/swebench rows coexist (this is *not*
+`datasets.load_dataset`, which would unify one Arrow schema and could reject a
+nested type clash slime never sees).
+
+`convert_scaleswe_data.py --merged` emits a single interleaved `<prefix>.jsonl`
+(instead of the default split-by-grader files), and `--verify-load` reloads the
+output the way slime does to confirm every row routes to a concrete protocol:
+
+```bash
+python -m examples.coding_agent_rl.convert_scaleswe_data \
+    scale-swe-021-rl-sample913-ecs.jsonl --out-prefix scale-swe-021-rl \
+    --merged --verify-load
+```
+
 ## Running the Script
 
 Override the paths at the top of the launcher, then run from a long-lived shell on the Ray head node (do **not** wrap in `nohup` — Ray child processes get cleaned up with it):
@@ -129,6 +151,7 @@ contract (read inside `slime/agent/`); `SWE_*` are this SWE example's task knobs
 | `SWE_ROLLOUT_GUARD_SEC` | `agent+eval+180` | Outer safety net wrapping the whole rollout (boot + workspace + agent + diff + eval). Auto-derived if unset. |
 | `SWE_BOOT_CONCURRENCY` | `16` | Cap on simultaneous sandbox boots (eases h2/SSL long-tail). |
 | `SWE_CC_PROMPT` | unset | Optional override for the user-turn prompt. Setting this to require sub-agent dispatch is the most reliable way to maximize fan-out. |
+| `SWE_TRAIN_PROTOCOL` / `SWE_EVAL_PROTOCOL` | `scaleswe` | Grading protocol for train / eval rollouts: `scaleswe`, `swebench`, or `auto`. `auto` picks per-sample from each row's own shape (a row with `swepro`/`eval_cmd`/`f2p_script` → scaleswe; else a row with `remote_env_info.test_patch` → swebench), so one dataset can interleave both formats. |
 
 `--rollout-max-response-len` is the per-turn generation cap passed to each
 SGLang `/generate` call as `max_new_tokens`. `--rollout-max-context-len` is the
