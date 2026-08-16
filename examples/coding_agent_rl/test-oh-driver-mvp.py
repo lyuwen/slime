@@ -225,7 +225,7 @@ async def run_sandbox(args: argparse.Namespace) -> int:
                 f"{_PY} not found in the sandbox image. "
                 "Make sure the image was built with the oh-env layer mounted at /opt/oh-env."
             )
-        log(f"/opt/oh-env/bin/python: present (no tarball needed)")
+        log("/opt/oh-env/bin/python: present (no tarball needed)")
 
         # -- ensure agent user + workdir -------------------------------------
         await ensure_agent_user(sb, workdir)

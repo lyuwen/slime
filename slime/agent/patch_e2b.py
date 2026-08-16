@@ -39,8 +39,8 @@ def patch_e2b(https: bool = True, validate_key: bool = True):
             def __jupyter_url_http(self) -> str:
                 return f"http://{__sandbox_get_host(self, JUPYTER_PORT)}"
 
-            setattr(SandboxSync, "_jupyter_url", property(__jupyter_url_http))
-        except ImportError as exc:
+            setattr(SandboxSync, "_jupyter_url", property(__jupyter_url_http))  # noqa: B010
+        except ImportError:
             pass
     if not validate_key:
         try:
