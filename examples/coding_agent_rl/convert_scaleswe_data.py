@@ -30,14 +30,17 @@ prompts whenever the checkpoint ships an AutoProcessor (a bare string trips an
 assert in slime/utils/data.py).
 
 ``--verify-load`` reloads each written file the way slime actually loads it --
-per-line ``json.loads`` with each row's ``metadata`` taken as an independent dict
-(``slime/utils/data.py::read_file``) -- and confirms every row routes to a
-concrete protocol under ``auto`` (see ``swe.detect_protocol``) carrying the
-fields ``generate.py`` reads. Note this is *not* ``datasets.load_dataset``: slime
-never unifies one Arrow schema across rows, so a mixed scaleswe/swebench file
-that ``load_dataset`` would reject on a nested type clash still trains fine here.
-scaleswe and swebench keep their grader payloads under disjoint ``metadata`` /
-``metadata.remote_env_info`` keys, so per-sample routing stays unambiguous.
+per-line ``json.loads`` that *skips* a malformed line and continues, with each
+row's ``metadata`` taken as an independent dict (``slime/utils/data.py::
+read_file``) -- and reports any row that would abort at rollout time, mirroring
+``generate.py``'s gate: missing ``image``/``workdir`` or a failing
+``evaluability_check`` (``swebench_import_failed`` is excused as an environment,
+not data, condition). It exits non-zero if any row is inadmissible. Note this is
+*not* ``datasets.load_dataset``: slime never unifies one Arrow schema across rows,
+so a mixed scaleswe/swebench file that ``load_dataset`` would reject on a nested
+type clash still trains fine here. scaleswe and swebench keep their grader
+payloads under disjoint ``metadata`` / ``metadata.remote_env_info`` keys, so
+per-sample routing stays unambiguous.
 
 Wire the outputs up with:
     --input-key prompt --label-key label --metadata-key metadata
@@ -125,9 +128,12 @@ def _build_row(row: dict) -> tuple[dict | None, str]:
     return {"prompt": prompt, "label": instance_id, "metadata": md}, kind
 
 
-def convert(src: str, out_script: str, out_patch: str) -> tuple[int, int, int]:
+def _convert_rows(src: str, sink) -> tuple[int, int, int]:
+    """Shared conversion loop: parse each raw row, build the slime row, skip
+    graderless rows, count by kind. ``sink(kind, slime_row)`` writes the row to
+    wherever the caller wants (split files or one merged file)."""
     n_script = n_patch = n_skip = 0
-    with open(src) as fin, open(out_script, "w") as fscript, open(out_patch, "w") as fpatch:
+    with open(src) as fin:
         for line in fin:
             line = line.strip()
             if not line:
@@ -136,77 +142,100 @@ def convert(src: str, out_script: str, out_patch: str) -> tuple[int, int, int]:
             slime_row, kind = _build_row(row)
             if slime_row is None:
                 print(
-                    f"[skip] {row.get('instance_id') or 'unknown'}: " "no f2p_script and no f2p_patch+FAIL_TO_PASS",
+                    f"[skip] {row.get('instance_id') or 'unknown'}: no f2p_script and no f2p_patch+FAIL_TO_PASS",
                     file=sys.stderr,
                 )
                 n_skip += 1
                 continue
-            out = fscript if kind == "script" else fpatch
-            out.write(json.dumps(slime_row, ensure_ascii=False) + "\n")
+            sink(kind, slime_row)
             n_script += kind == "script"
             n_patch += kind == "patch"
     return n_script, n_patch, n_skip
+
+
+def convert(src: str, out_script: str, out_patch: str) -> tuple[int, int, int]:
+    with open(out_script, "w") as fscript, open(out_patch, "w") as fpatch:
+
+        def sink(kind: str, slime_row: dict) -> None:
+            out = fscript if kind == "script" else fpatch
+            out.write(json.dumps(slime_row, ensure_ascii=False) + "\n")
+
+        return _convert_rows(src, sink)
 
 
 def convert_merged(src: str, out_merged: str) -> tuple[int, int, int]:
     """Like :func:`convert` but interleaves both grader types into one file."""
-    n_script = n_patch = n_skip = 0
-    with open(src) as fin, open(out_merged, "w") as fout:
-        for line in fin:
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            slime_row, kind = _build_row(row)
-            if slime_row is None:
-                print(
-                    f"[skip] {row.get('instance_id') or 'unknown'}: " "no f2p_script and no f2p_patch+FAIL_TO_PASS",
-                    file=sys.stderr,
-                )
-                n_skip += 1
-                continue
+    with open(out_merged, "w") as fout:
+
+        def sink(_kind: str, slime_row: dict) -> None:
             fout.write(json.dumps(slime_row, ensure_ascii=False) + "\n")
-            n_script += kind == "script"
-            n_patch += kind == "patch"
-    return n_script, n_patch, n_skip
+
+        return _convert_rows(src, sink)
 
 
-def verify_load(path: str) -> int:
-    """Reload ``path`` the way slime does and prove every row is trainable;
-    return the row count. Raises on the first row that fails to route.
+def verify_load(path: str) -> tuple[int, int]:
+    """Reload ``path`` the way slime does and confirm each row is admissible;
+    return ``(n_ok, n_bad)``. Does not raise for data defects -- it reports them.
 
     slime reads JSONL per line (``slime/utils/data.py::read_file`` -> per-line
-    ``json.loads``) and hands each row's ``metadata`` to ``Sample`` untouched --
-    there is no cross-row schema unification, so heterogeneous metadata across
-    scaleswe and swebench rows is fine (unlike ``datasets.load_dataset``, which
-    unifies one Arrow schema and would reject a nested type clash slime never
-    sees). The meaningful check is therefore per-row: does each row route to a
-    concrete protocol under ``auto`` and carry the fields ``generate.py`` reads?
+    ``json.loads``), *skips* a malformed line and continues, and hands each row's
+    ``metadata`` to ``Sample`` untouched -- there is no cross-row schema
+    unification, so heterogeneous scaleswe/swebench metadata is fine (unlike
+    ``datasets.load_dataset``, which unifies one Arrow schema and would reject a
+    nested type clash slime never sees). We mirror that: malformed lines are
+    counted as bad and skipped, not fatal.
+
+    "Admissible" mirrors ``generate.py``'s per-sample gate: the row must resolve
+    a concrete protocol under ``auto``, carry a usable ``image``/``workdir``, and
+    pass ``swe.evaluability_check`` -- i.e. exactly the rows that would NOT abort
+    at rollout time. The one exception is ``swebench_import_failed``, an
+    environment condition (no ``swebench`` installed on the prep host), not a data
+    defect, so it does not fail verification.
     """
     from slime.utils.types import Sample
 
     from . import swe
 
-    n = 0
+    n_ok = n_bad = 0
     with open(path, encoding="utf-8") as f:
         for line_num, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
-            data = json.loads(line)  # mirrors read_file's jsonl reader
-            sample = Sample.__new__(Sample)
-            sample.metadata = data.get("metadata") or {}
-            sample.prompt = data.get("prompt")
-            sample.label = data.get("label")
-            md = swe.get_metadata(sample, swe.PROTOCOL_AUTO)
-            if md["protocol"] not in (swe.PROTOCOL_SCALESWE, swe.PROTOCOL_SWEBENCH):
-                raise ValueError(f"{path}:{line_num}: row did not route to a concrete protocol: {md['protocol']!r}")
-            if not md.get("instance_id") or "grading" not in md:
-                raise ValueError(
-                    f"{path}:{line_num}: routed row missing instance_id/grading: {md.get('instance_id')!r}"
-                )
-            n += 1
-    return n
+            try:
+                data = json.loads(line)  # mirrors read_file's jsonl reader
+            except json.JSONDecodeError as e:
+                print(f"[bad] {path}:{line_num}: malformed JSON: {e}", file=sys.stderr)
+                n_bad += 1
+                continue
+            reason = _admission_reason(swe, Sample, data)
+            if reason is None:
+                n_ok += 1
+            else:
+                label = data.get("label") or (data.get("metadata") or {}).get("instance_id") or "unknown"
+                print(f"[bad] {path}:{line_num}: {label}: {reason}", file=sys.stderr)
+                n_bad += 1
+    return n_ok, n_bad
+
+
+def _admission_reason(swe, sample_cls, data: dict) -> str | None:
+    """Return why ``data`` would abort at rollout time, or ``None`` if admissible.
+
+    Mirrors the gate in ``generate.py`` (missing image/workdir, then
+    ``evaluability_check``) so verify-load flags exactly the rows a run would drop
+    -- with ``swebench_import_failed`` excused as an environment, not data, issue.
+    """
+    sample = sample_cls.__new__(sample_cls)
+    sample.metadata = data.get("metadata") or {}
+    sample.prompt = data.get("prompt")
+    sample.label = data.get("label")
+    md = swe.get_metadata(sample, swe.PROTOCOL_AUTO)
+    if not md.get("image") or not md.get("workdir"):
+        return "missing_image_or_workdir"
+    reason = swe.evaluability_check(md)
+    if reason and not reason.startswith("swebench_import_failed"):
+        return f"unevaluatable:{reason}"
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -227,8 +256,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--verify-load",
         action="store_true",
-        help="reload each written file the way slime does (per-line json, per-row "
-        "metadata) and confirm every row routes to a concrete protocol under `auto`",
+        help="reload each written file the way slime does (per-line json, skipping "
+        "malformed lines) and report rows that would abort at rollout time "
+        "(missing image/workdir or failing evaluability_check); exit 1 if any",
     )
     args = p.parse_args(argv)
 
@@ -254,9 +284,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"total written  : {n_script + n_patch:5d}")
 
     if args.verify_load:
+        total_bad = 0
         for path in outputs:
-            n = verify_load(path)
-            print(f"verify-load    : {n:5d} rows load cleanly <- {path}")
+            n_ok, n_bad = verify_load(path)
+            total_bad += n_bad
+            status = f"{n_ok:5d} admissible" + (f", {n_bad} bad" if n_bad else "")
+            print(f"verify-load    : {status} <- {path}")
+        if total_bad:
+            print(f"verify-load    : FAILED, {total_bad} inadmissible row(s)", file=sys.stderr)
+            return 1
 
     return 0
 

@@ -136,32 +136,68 @@ def test_merged_interleaves_both_grader_types(tmp_path):
 
 
 def test_verify_load_routes_mixed_scaleswe_and_swebench(tmp_path):
-    """A file mixing a scaleswe row and a swebench row loads row-by-row and each
-    routes to its own protocol under auto -- exactly what slime does at train time."""
+    """A file mixing an admissible scaleswe row and an admissible swebench row
+    loads row-by-row and each routes to its own protocol under auto -- exactly
+    what slime does at train time. (swebench evaluability is excused when the
+    swebench package is absent on the prep host.)"""
     path = Path(
         _write(
             tmp_path / "mixed.jsonl",
             [
-                {"prompt": [{"role": "user", "content": "a"}], "label": "s1", "metadata": {"eval_cmd": "pytest"}},
+                {
+                    "prompt": [{"role": "user", "content": "a"}],
+                    "label": "s1",
+                    "metadata": {"image": "i:1", "workdir": "/w", "eval_cmd": "pytest"},
+                },
                 {
                     "prompt": [{"role": "user", "content": "b"}],
                     "label": "sb1",
                     "metadata": {
                         "instance_id": "sb1",
-                        "remote_env_info": {"repo": "o/r", "base_commit": "c", "test_patch": "diff"},
+                        "remote_env_info": {
+                            "image": "i:2",
+                            "workdir": "/testbed",
+                            "repo": "o/r",
+                            "base_commit": "c",
+                            "test_patch": "diff",
+                        },
                     },
                 },
             ],
         )
     )
-    assert conv.verify_load(str(path)) == 2
+    assert conv.verify_load(str(path)) == (2, 0)
 
 
-def test_verify_load_rejects_malformed_json(tmp_path):
+def test_verify_load_flags_missing_image_workdir(tmp_path):
+    """A scaleswe row with a grader but no image/workdir would abort at rollout
+    time (generate.py's missing_image_or_workdir gate); verify_load counts it bad
+    rather than silently passing it (regression guard for a tautological check)."""
+    path = Path(
+        _write(
+            tmp_path / "thin.jsonl",
+            [{"prompt": [{"role": "user", "content": "a"}], "label": "s1", "metadata": {"eval_cmd": "pytest"}}],
+        )
+    )
+    assert conv.verify_load(str(path)) == (0, 1)
+
+
+def test_verify_load_skips_malformed_json_like_slime(tmp_path):
+    """slime's read_file skips a malformed line and continues; verify_load mirrors
+    that -- the bad line is counted, not fatal, and a valid line still passes."""
     path = tmp_path / "broken.jsonl"
-    path.write_text("{not json}\n")
-    with pytest.raises(json.JSONDecodeError):
-        conv.verify_load(str(path))
+    path.write_text(
+        "{not json}\n"
+        + json.dumps(
+            {
+                "prompt": [{"role": "user", "content": "a"}],
+                "label": "s1",
+                "metadata": {"image": "i", "workdir": "/w", "eval_cmd": "pytest"},
+            }
+        )
+        + "\n"
+    )
+    assert conv.verify_load(str(path)) == (1, 1)
 
 
 if __name__ == "__main__":
