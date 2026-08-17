@@ -8,6 +8,7 @@ No GPUs or live cluster required. The test verifies that the launcher:
   - enables the three metrics-only mismatch flags
   - does not set any eval flag
 """
+
 import pathlib
 import pytest
 
@@ -33,18 +34,16 @@ def test_uses_train_async(launcher_text):
     # train.py (without _async) must not appear as the driver argument
     # (it still appears as a substring of train_async.py, so check the full token)
     lines_with_trainpy = [
-        l for l in launcher_text.splitlines()
-        if "train.py" in l and "train_async.py" not in l and not l.strip().startswith("#")
+        line
+        for line in launcher_text.splitlines()
+        if "train.py" in line and "train_async.py" not in line and not line.strip().startswith("#")
     ]
-    assert not lines_with_trainpy, (
-        f"found non-async train.py reference in active lines: {lines_with_trainpy}"
-    )
+    assert not lines_with_trainpy, f"found non-async train.py reference in active lines: {lines_with_trainpy}"
 
 
 def test_no_colocate(launcher_text):
     active_lines = [
-        l for l in launcher_text.splitlines()
-        if "--colocate" in l and not l.strip().startswith("#")
+        line for line in launcher_text.splitlines() if "--colocate" in line and not line.strip().startswith("#")
     ]
     assert not active_lines, f"--colocate must not appear in active lines: {active_lines}"
 
@@ -71,16 +70,12 @@ def test_fully_async_rollout_function(launcher_text):
 def test_mismatch_metrics_enabled(launcher_text):
     assert "--get-mismatch-metrics" in launcher_text
     assert "examples/train_infer_mismatch_helper/mis.yaml" in launcher_text
-    assert (
-        "examples.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp"
-        in launcher_text
-    )
+    assert "examples.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp" in launcher_text
 
 
 def test_no_use_tis(launcher_text):
     active_lines = [
-        l for l in launcher_text.splitlines()
-        if "--use-tis" in l and not l.strip().startswith("#")
+        line for line in launcher_text.splitlines() if "--use-tis" in line and not line.strip().startswith("#")
     ]
     assert not active_lines, "--use-tis must not appear (metrics-only pass)"
 
@@ -88,8 +83,7 @@ def test_no_use_tis(launcher_text):
 def test_no_eval_args(launcher_text):
     for flag in ("--eval-interval", "--eval-prompt-data", "--eval-config"):
         active_lines = [
-            l for l in launcher_text.splitlines()
-            if flag in l and not l.strip().startswith("#")
+            line for line in launcher_text.splitlines() if flag in line and not line.strip().startswith("#")
         ]
         assert not active_lines, f"{flag} must not appear (fully-async rejects eval)"
 
@@ -101,4 +95,5 @@ def test_startup_validation_present(launcher_text):
 
 if __name__ == "__main__":
     import pytest as _pytest
+
     _pytest.main([__file__, "-v"])
