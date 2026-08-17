@@ -71,6 +71,7 @@ class SweConfig:
     rollout_guard_sec: int
     boot_concurrency: int
     boot_retries: int
+    rollout_retries: int
     oh_fake_user: bool
     oh_max_iterations: int
     oh_tools: list[str]
@@ -88,6 +89,9 @@ class SweConfig:
         oh_extra_envs = json.loads(oh_extra_envs_raw) if oh_extra_envs_raw else {}
         if not isinstance(oh_extra_envs, dict):
             raise ValueError("SLIME_AGENT_OH_EXTRA_ENVS must be a JSON object")
+        rollout_retries = int(os.environ.get("SWE_ROLLOUT_RETRIES", "2"))
+        if rollout_retries < 0:
+            raise ValueError("SWE_ROLLOUT_RETRIES must be non-negative")
         return cls(
             eval_protocol=os.environ.get("SWE_EVAL_PROTOCOL", swe.PROTOCOL_SCALESWE),
             train_protocol=os.environ.get("SWE_TRAIN_PROTOCOL", swe.PROTOCOL_SCALESWE),
@@ -100,6 +104,7 @@ class SweConfig:
             rollout_guard_sec=guard,
             boot_concurrency=int(os.environ.get("SWE_BOOT_CONCURRENCY", "16")),
             boot_retries=int(os.environ.get("SWE_BOOT_RETRIES", "2")),
+            rollout_retries=rollout_retries,
             oh_fake_user=os.environ.get("SWE_OH_FAKE_USER", "0") not in ("0", "", "false", "False"),
             oh_max_iterations=int(os.environ.get("SWE_OH_MAX_ITERATIONS", "100")),
             oh_tools=oh_tools,
@@ -314,7 +319,7 @@ def _is_retryable(e: Exception) -> bool:
 
 
 async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], evaluation: bool = False):
-    """Per-sample agent function with wall-clock guard (see rollout_guard_sec)."""
+    """Per-sample agent function with wall-clock guard and setup retries."""
     state = _AdapterService(args)
     protocol = CONFIG.eval_protocol if evaluation else CONFIG.train_protocol
     md = swe.get_metadata(base_sample, protocol)
@@ -326,22 +331,22 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         return _abort_result(base_sample, f"unevaluatable:{reason}", instance_id)
 
     session_id = base_sample.session_id = _session_id(base_sample, instance_id)
-    state.adapter.open_session(
-        session_id,
-        sampling_defaults=sampling_params,
-        max_context_tokens=state.max_context_len,
-    )
+    session_open = False
     t0 = time.time()
-    max_retries = int(os.environ.get("SWE_ROLLOUT_RETRIES", "2"))
-    last_error = None
+    traj_data = None
 
     try:
-        for attempt in range(max_retries + 1):
-            traj_data = None
-            try:
-                async with asyncio.timeout(CONFIG.rollout_guard_sec):
+        async with asyncio.timeout(CONFIG.rollout_guard_sec):
+            for attempt in range(CONFIG.rollout_retries + 1):
+                try:
                     async with boot_agent_sandbox(md["image"], instance_id) as sb:
                         await swe.prepare_workspace(sb, md["workdir"], md)
+                        state.adapter.open_session(
+                            session_id,
+                            sampling_defaults=sampling_params,
+                            max_context_tokens=state.max_context_len,
+                        )
+                        session_open = True
                         oh_kwargs = (
                             {
                                 "fake_user": CONFIG.oh_fake_user,
@@ -364,111 +369,105 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         diff_text = await swe.git_diff(sb, md["workdir"])
                         if AGENT_NAME == "openhands":
                             traj_data = await _read_sandbox_trajectory(sb, OpenHandsHarness.trajectory_sandbox_path)
-
-                    reward, applied_cleanly = await swe.run_evaluation(
-                        md,
-                        diff_text=diff_text,
-                        timeout_sec=CONFIG.eval_timeout_sec,
-                    )
-                    if traj_data is not None:
-                        _persist_trajectory(
-                            _trajectory_root(),
-                            base_sample,
-                            messages=traj_data["messages"],
-                            tools=traj_data["tools"],
-                            diff_text=diff_text,
-                            reward=float(reward),
-                            applied_cleanly=bool(applied_cleanly),
-                            instance_id=instance_id,
-                            session_id=session_id,
-                            agent_exit_code=agent_exit_code,
-                        )
-                    if evaluation:
-                        logger.info(
-                            "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs (eval-only)",
-                            instance_id,
-                            float(reward),
-                            bool(applied_cleanly),
-                            agent_exit_code,
-                            time.time() - t0,
-                        )
-                        return _eval_result(
-                            base_sample,
-                            reward=float(reward),
-                            applied_cleanly=bool(applied_cleanly),
-                            agent_exit_code=agent_exit_code,
-                            instance_id=instance_id,
-                        )
-
-                    samples = await state.adapter.finish_session(
-                        session_id,
-                        base_sample=base_sample,
-                        reward=float(reward),
-                        extra_metadata={
-                            "grading_solved": float(reward) == 1.0,
-                            "instance_id": instance_id,
-                        },
-                    )
-                    if not samples:
-                        return _abort_result(base_sample, "adapter_session_empty", instance_id)
-
-                    for s in samples:
-                        s.metadata = {**(s.metadata or {}), "agent_exit_code": agent_exit_code}
-                    if agent_exit_code != 0:
-                        reason = "time budget exceeded" if agent_exit_code < 0 else f"CLI error (exit {agent_exit_code})"
-                        logger.warning(
-                            "[coding_agent_rl] %s: agent_exit_code=%d (%s)",
-                            instance_id,
-                            agent_exit_code,
-                            reason,
-                        )
-                    logger.info(
-                        "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs segments=%d",
-                        instance_id,
-                        float(reward),
-                        bool(applied_cleanly),
-                        agent_exit_code,
-                        time.time() - t0,
-                        len(samples),
-                    )
-                    return samples
-
-            except asyncio.TimeoutError:
-                # Wall-clock timeout is not retryable — the agent ran too long
-                _log_timeout_diagnostic(t0, instance_id)
-                return _abort_result(base_sample, "wall_clock_timeout", instance_id)
-
-            except Exception as e:
-                last_error = e
-                if attempt < max_retries and _is_retryable(e):
+                    break
+                except Exception as error:
+                    if session_open or attempt >= CONFIG.rollout_retries or not _is_retryable(error):
+                        raise
                     backoff = 2**attempt
                     logger.warning(
-                        "[coding_agent_rl] %s: attempt %d/%d failed: %s, retrying in %ds...",
+                        "[coding_agent_rl] %s: setup attempt %d/%d failed: %s, retrying in %ds...",
                         instance_id,
                         attempt + 1,
-                        max_retries + 1,
-                        e,
+                        CONFIG.rollout_retries + 1,
+                        error,
                         backoff,
                     )
                     await asyncio.sleep(backoff)
-                    continue
-                else:
-                    # Non-retryable or exhausted retries
-                    logger.warning(
-                        "[coding_agent_rl] %s: rollout failed after %d attempt(s): %s\n%s",
-                        instance_id,
-                        attempt + 1,
-                        e,
-                        traceback.format_exc(),
-                    )
-                    return _abort_result(base_sample, f"exception:{type(e).__name__}", instance_id)
 
-        # Should never reach here, but for safety
-        return _abort_result(base_sample, f"max_retries_exhausted:{type(last_error).__name__}", instance_id)
+            reward, applied_cleanly = await swe.run_evaluation(
+                md,
+                diff_text=diff_text,
+                timeout_sec=CONFIG.eval_timeout_sec,
+            )
+            if traj_data is not None:
+                _persist_trajectory(
+                    _trajectory_root(),
+                    base_sample,
+                    messages=traj_data["messages"],
+                    tools=traj_data["tools"],
+                    diff_text=diff_text,
+                    reward=float(reward),
+                    applied_cleanly=bool(applied_cleanly),
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    agent_exit_code=agent_exit_code,
+                )
+            if evaluation:
+                logger.info(
+                    "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs (eval-only)",
+                    instance_id,
+                    float(reward),
+                    bool(applied_cleanly),
+                    agent_exit_code,
+                    time.time() - t0,
+                )
+                return _eval_result(
+                    base_sample,
+                    reward=float(reward),
+                    applied_cleanly=bool(applied_cleanly),
+                    agent_exit_code=agent_exit_code,
+                    instance_id=instance_id,
+                )
 
+            samples = await state.adapter.finish_session(
+                session_id,
+                base_sample=base_sample,
+                reward=float(reward),
+                extra_metadata={
+                    "grading_solved": float(reward) == 1.0,
+                    "instance_id": instance_id,
+                },
+            )
+            if not samples:
+                return _abort_result(base_sample, "adapter_session_empty", instance_id)
+
+            for sample in samples:
+                sample.metadata = {**(sample.metadata or {}), "agent_exit_code": agent_exit_code}
+            if agent_exit_code != 0:
+                reason = "time budget exceeded" if agent_exit_code < 0 else f"CLI error (exit {agent_exit_code})"
+                logger.warning(
+                    "[coding_agent_rl] %s: agent_exit_code=%d (%s)",
+                    instance_id,
+                    agent_exit_code,
+                    reason,
+                )
+            logger.info(
+                "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs segments=%d",
+                instance_id,
+                float(reward),
+                bool(applied_cleanly),
+                agent_exit_code,
+                time.time() - t0,
+                len(samples),
+            )
+            return samples
+
+    except asyncio.TimeoutError:
+        _log_timeout_diagnostic(t0, instance_id)
+        return _abort_result(base_sample, "wall_clock_timeout", instance_id)
+    except Exception as error:
+        logger.warning(
+            "[coding_agent_rl] %s: rollout failed: %s\n%s",
+            instance_id,
+            error,
+            traceback.format_exc(),
+        )
+        return _abort_result(base_sample, f"exception:{type(error).__name__}", instance_id)
     finally:
-        await state.adapter.drop_session(session_id, wait_timeout=30)  # cleanup only, idempotent
-        await asyncio.sleep(10)
+        if session_open:
+            await state.adapter.drop_session(session_id, wait_timeout=30)  # cleanup only, idempotent
+            await asyncio.sleep(10)
+
 
 
 def _log_timeout_diagnostic(t0: float, instance_id: str) -> None:

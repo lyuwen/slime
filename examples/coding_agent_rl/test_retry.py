@@ -7,6 +7,7 @@ Run with: pytest examples/coding_agent_rl/test_retry.py
 
 import asyncio
 import sys
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,7 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from examples.coding_agent_rl.generate import _is_retryable  # noqa: E402
+from examples.coding_agent_rl.generate import CONFIG, SweConfig, _is_retryable  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +65,18 @@ def test_not_retryable_generic_runtime_error():
     assert not _is_retryable(RuntimeError("division by zero"))
 
 
+def test_retry_config_rejects_negative_value():
+    with patch.dict("os.environ", {"SWE_ROLLOUT_RETRIES": "-1"}):
+        with pytest.raises(ValueError, match="must be non-negative"):
+            SweConfig.from_env()
+
+
+def test_retry_config_rejects_non_integer_value():
+    with patch.dict("os.environ", {"SWE_ROLLOUT_RETRIES": "invalid"}):
+        with pytest.raises(ValueError, match="invalid literal"):
+            SweConfig.from_env()
+
+
 # ---------------------------------------------------------------------------
 # generate() retry loop — integration tests with mocked E2B
 # ---------------------------------------------------------------------------
@@ -108,6 +121,10 @@ def base_patches():
         patch("examples.coding_agent_rl.generate.get_prompt", return_value="prompt"),
         patch("examples.coding_agent_rl.generate._abort_result", side_effect=lambda s, r, i: [r]),
         patch("examples.coding_agent_rl.generate.AGENT_NAME", "openhands"),
+        patch(
+            "examples.coding_agent_rl.generate.CONFIG",
+            replace(CONFIG, rollout_retries=2),
+        ),
         patch("examples.coding_agent_rl.generate._read_sandbox_trajectory", new_callable=AsyncMock, return_value=None),
     ):
         state = _make_state_mock()
@@ -141,8 +158,7 @@ async def test_success_on_first_attempt(base_patches):
     mock_swe = base_patches["mock_swe"]
     mock_swe.prepare_workspace = AsyncMock()
 
-    with patch.dict("os.environ", {"SWE_ROLLOUT_RETRIES": "2"}):
-        result = await generate(MagicMock(), _make_sample_mock(), {})
+    await generate(MagicMock(), _make_sample_mock(), {})
 
     assert mock_swe.prepare_workspace.call_count == 1
     base_patches["state"].adapter.drop_session.assert_awaited_once()
@@ -163,10 +179,7 @@ async def test_retry_succeeds_on_second_attempt(base_patches):
     async def fast_sleep(n):
         sleep_calls.append(n)
 
-    with (
-        patch.dict("os.environ", {"SWE_ROLLOUT_RETRIES": "2"}),
-        patch("examples.coding_agent_rl.generate.asyncio.sleep", side_effect=fast_sleep),
-    ):
+    with patch("examples.coding_agent_rl.generate.asyncio.sleep", side_effect=fast_sleep):
         result = await generate(MagicMock(), _make_sample_mock(), {})
 
     assert mock_swe.prepare_workspace.call_count == 2
@@ -193,10 +206,7 @@ async def test_retry_exhausted_returns_abort(base_patches):
     async def fast_sleep(n):
         sleep_calls.append(n)
 
-    with (
-        patch.dict("os.environ", {"SWE_ROLLOUT_RETRIES": "2"}),
-        patch("examples.coding_agent_rl.generate.asyncio.sleep", side_effect=fast_sleep),
-    ):
+    with patch("examples.coding_agent_rl.generate.asyncio.sleep", side_effect=fast_sleep):
         result = await generate(MagicMock(), _make_sample_mock(), {})
 
     assert mock_swe.prepare_workspace.call_count == 3  # 1 original + 2 retries
@@ -218,11 +228,8 @@ async def test_non_retryable_aborts_immediately(base_patches):
     async def fast_sleep(n):
         sleep_calls.append(n)
 
-    with (
-        patch.dict("os.environ", {"SWE_ROLLOUT_RETRIES": "2"}),
-        patch("examples.coding_agent_rl.generate.asyncio.sleep", side_effect=fast_sleep),
-    ):
-        result = await generate(MagicMock(), _make_sample_mock(), {})
+    with patch("examples.coding_agent_rl.generate.asyncio.sleep", side_effect=fast_sleep):
+        await generate(MagicMock(), _make_sample_mock(), {})
 
     assert mock_swe.prepare_workspace.call_count == 1
     # The only sleep is the 10s cleanup in the finally block — no backoff sleeps
@@ -237,15 +244,14 @@ async def test_cleanup_called_on_success(base_patches):
 
     base_patches["mock_swe"].prepare_workspace = AsyncMock()
 
-    with patch.dict("os.environ", {"SWE_ROLLOUT_RETRIES": "2"}):
-        await generate(MagicMock(), _make_sample_mock(), {})
+    await generate(MagicMock(), _make_sample_mock(), {})
 
     base_patches["state"].adapter.drop_session.assert_awaited_once()
 
 
 @pytest.mark.anyio
-async def test_cleanup_called_on_failure(base_patches):
-    """drop_session is always called, even when all retries fail."""
+async def test_no_cleanup_when_setup_never_opens_session(base_patches):
+    """Setup exhaustion does not drop a session that was never opened."""
     from examples.coding_agent_rl.generate import generate
 
     base_patches["mock_swe"].prepare_workspace = AsyncMock(
@@ -255,14 +261,30 @@ async def test_cleanup_called_on_failure(base_patches):
     async def fast_sleep(n):
         pass
 
-    with (
-        patch.dict("os.environ", {"SWE_ROLLOUT_RETRIES": "2"}),
-        patch("examples.coding_agent_rl.generate.asyncio.sleep", side_effect=fast_sleep),
-    ):
+    with patch("examples.coding_agent_rl.generate.asyncio.sleep", side_effect=fast_sleep):
         await generate(MagicMock(), _make_sample_mock(), {})
 
+    base_patches["state"].adapter.drop_session.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_failure_after_session_open_is_not_retried(base_patches):
+    """Once the harness starts recording turns, failures abort without retry."""
+    from examples.coding_agent_rl.generate import generate
+
+    mock_swe = base_patches["mock_swe"]
+    mock_swe.prepare_workspace = AsyncMock()
+    base_patches["mock_harness_inst"].run = AsyncMock(
+        side_effect=RuntimeError("e2b exec failed (exit=255) after agent start")
+    )
+
+    async def fast_sleep(_):
+        pass
+
+    with patch("examples.coding_agent_rl.generate.asyncio.sleep", side_effect=fast_sleep):
+        result = await generate(MagicMock(), _make_sample_mock(), {})
+
+    assert mock_swe.prepare_workspace.call_count == 1
+    assert base_patches["mock_harness_inst"].run.await_count == 1
+    assert result == ["exception:RuntimeError"]
     base_patches["state"].adapter.drop_session.assert_awaited_once()
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
