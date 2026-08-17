@@ -284,6 +284,35 @@ class _AdapterService(metaclass=SingletonMeta):
         )
 
 
+def _is_retryable(e: Exception) -> bool:
+    """Determine if an exception represents a transient failure worth retrying.
+
+    Retryable errors include E2B RPC failures, workspace setup issues, and
+    certain network/sandbox errors. Non-retryable errors include dataset
+    issues, adapter problems, and application logic failures.
+    """
+    msg = str(e).lower()
+    exc_type = type(e).__name__.lower()
+
+    # E2B exec failures (especially exit=255) are often transient
+    if "e2b exec failed" in msg or "exit=255" in msg or "exit 255" in msg:
+        return True
+
+    # General sandbox/RPC errors
+    if "runtimeerror" in exc_type and ("sandbox" in msg or "exec" in msg or "e2b" in msg):
+        return True
+
+    # Connection/network issues (but not asyncio.TimeoutError — that's the wall-clock guard)
+    if any(x in msg for x in ["connection", "timeout", "network", "unavailable"]) and "asyncio" not in exc_type:
+        return True
+
+    # Sandbox boot failures
+    if "boot" in msg or "create" in msg:
+        return True
+
+    return False
+
+
 async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], evaluation: bool = False):
     """Per-sample agent function with wall-clock guard (see rollout_guard_sec)."""
     state = _AdapterService(args)
@@ -303,113 +332,140 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         max_context_tokens=state.max_context_len,
     )
     t0 = time.time()
-    traj_data = None
+    max_retries = int(os.environ.get("SWE_ROLLOUT_RETRIES", "2"))
+    last_error = None
+
     try:
-        async with asyncio.timeout(CONFIG.rollout_guard_sec):
-            async with boot_agent_sandbox(md["image"], instance_id) as sb:
-                await swe.prepare_workspace(sb, md["workdir"], md)
-                oh_kwargs = (
-                    {
-                        "fake_user": CONFIG.oh_fake_user,
-                        "max_iterations": CONFIG.oh_max_iterations,
-                        "tools": CONFIG.oh_tools,
-                        "extra_envs": CONFIG.oh_extra_envs,
-                    }
-                    if AGENT_NAME == "openhands"
-                    else {}
-                )
-                agent_exit_code = await HARNESS_CLS().run(
-                    sb,
-                    workdir=md["workdir"],
-                    session_id=session_id,
-                    adapter_url=state.adapter_url,
-                    time_budget_sec=CONFIG.agent_time_budget_sec,
-                    prompt=get_prompt(md),
-                    **oh_kwargs,
-                )
-                diff_text = await swe.git_diff(sb, md["workdir"])
-                if AGENT_NAME == "openhands":
-                    traj_data = await _read_sandbox_trajectory(sb, OpenHandsHarness.trajectory_sandbox_path)
+        for attempt in range(max_retries + 1):
+            traj_data = None
+            try:
+                async with asyncio.timeout(CONFIG.rollout_guard_sec):
+                    async with boot_agent_sandbox(md["image"], instance_id) as sb:
+                        await swe.prepare_workspace(sb, md["workdir"], md)
+                        oh_kwargs = (
+                            {
+                                "fake_user": CONFIG.oh_fake_user,
+                                "max_iterations": CONFIG.oh_max_iterations,
+                                "tools": CONFIG.oh_tools,
+                                "extra_envs": CONFIG.oh_extra_envs,
+                            }
+                            if AGENT_NAME == "openhands"
+                            else {}
+                        )
+                        agent_exit_code = await HARNESS_CLS().run(
+                            sb,
+                            workdir=md["workdir"],
+                            session_id=session_id,
+                            adapter_url=state.adapter_url,
+                            time_budget_sec=CONFIG.agent_time_budget_sec,
+                            prompt=get_prompt(md),
+                            **oh_kwargs,
+                        )
+                        diff_text = await swe.git_diff(sb, md["workdir"])
+                        if AGENT_NAME == "openhands":
+                            traj_data = await _read_sandbox_trajectory(sb, OpenHandsHarness.trajectory_sandbox_path)
 
-            reward, applied_cleanly = await swe.run_evaluation(
-                md,
-                diff_text=diff_text,
-                timeout_sec=CONFIG.eval_timeout_sec,
-            )
-            if traj_data is not None:
-                _persist_trajectory(
-                    _trajectory_root(),
-                    base_sample,
-                    messages=traj_data["messages"],
-                    tools=traj_data["tools"],
-                    diff_text=diff_text,
-                    reward=float(reward),
-                    applied_cleanly=bool(applied_cleanly),
-                    instance_id=instance_id,
-                    session_id=session_id,
-                    agent_exit_code=agent_exit_code,
-                )
-            if evaluation:
-                logger.info(
-                    "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs (eval-only)",
-                    instance_id,
-                    float(reward),
-                    bool(applied_cleanly),
-                    agent_exit_code,
-                    time.time() - t0,
-                )
-                return _eval_result(
-                    base_sample,
-                    reward=float(reward),
-                    applied_cleanly=bool(applied_cleanly),
-                    agent_exit_code=agent_exit_code,
-                    instance_id=instance_id,
-                )
+                    reward, applied_cleanly = await swe.run_evaluation(
+                        md,
+                        diff_text=diff_text,
+                        timeout_sec=CONFIG.eval_timeout_sec,
+                    )
+                    if traj_data is not None:
+                        _persist_trajectory(
+                            _trajectory_root(),
+                            base_sample,
+                            messages=traj_data["messages"],
+                            tools=traj_data["tools"],
+                            diff_text=diff_text,
+                            reward=float(reward),
+                            applied_cleanly=bool(applied_cleanly),
+                            instance_id=instance_id,
+                            session_id=session_id,
+                            agent_exit_code=agent_exit_code,
+                        )
+                    if evaluation:
+                        logger.info(
+                            "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs (eval-only)",
+                            instance_id,
+                            float(reward),
+                            bool(applied_cleanly),
+                            agent_exit_code,
+                            time.time() - t0,
+                        )
+                        return _eval_result(
+                            base_sample,
+                            reward=float(reward),
+                            applied_cleanly=bool(applied_cleanly),
+                            agent_exit_code=agent_exit_code,
+                            instance_id=instance_id,
+                        )
 
-            samples = await state.adapter.finish_session(
-                session_id,
-                base_sample=base_sample,
-                reward=float(reward),
-                extra_metadata={
-                    "grading_solved": float(reward) == 1.0,
-                    "instance_id": instance_id,
-                },
-            )
-            if not samples:
-                return _abort_result(base_sample, "adapter_session_empty", instance_id)
+                    samples = await state.adapter.finish_session(
+                        session_id,
+                        base_sample=base_sample,
+                        reward=float(reward),
+                        extra_metadata={
+                            "grading_solved": float(reward) == 1.0,
+                            "instance_id": instance_id,
+                        },
+                    )
+                    if not samples:
+                        return _abort_result(base_sample, "adapter_session_empty", instance_id)
 
-            for s in samples:
-                s.metadata = {**(s.metadata or {}), "agent_exit_code": agent_exit_code}
-            if agent_exit_code != 0:
-                reason = "time budget exceeded" if agent_exit_code < 0 else f"CLI error (exit {agent_exit_code})"
-                logger.warning(
-                    "[coding_agent_rl] %s: agent_exit_code=%d (%s)",
-                    instance_id,
-                    agent_exit_code,
-                    reason,
-                )
-            logger.info(
-                "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs segments=%d",
-                instance_id,
-                float(reward),
-                bool(applied_cleanly),
-                agent_exit_code,
-                time.time() - t0,
-                len(samples),
-            )
-            return samples
+                    for s in samples:
+                        s.metadata = {**(s.metadata or {}), "agent_exit_code": agent_exit_code}
+                    if agent_exit_code != 0:
+                        reason = "time budget exceeded" if agent_exit_code < 0 else f"CLI error (exit {agent_exit_code})"
+                        logger.warning(
+                            "[coding_agent_rl] %s: agent_exit_code=%d (%s)",
+                            instance_id,
+                            agent_exit_code,
+                            reason,
+                        )
+                    logger.info(
+                        "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs segments=%d",
+                        instance_id,
+                        float(reward),
+                        bool(applied_cleanly),
+                        agent_exit_code,
+                        time.time() - t0,
+                        len(samples),
+                    )
+                    return samples
 
-    except asyncio.TimeoutError:
-        _log_timeout_diagnostic(t0, instance_id)
-        return _abort_result(base_sample, "wall_clock_timeout", instance_id)
-    except Exception as e:
-        logger.warning(
-            "[coding_agent_rl] %s: rollout failed: %s\n%s",
-            instance_id,
-            e,
-            traceback.format_exc(),
-        )
-        return _abort_result(base_sample, f"exception:{type(e).__name__}", instance_id)
+            except asyncio.TimeoutError:
+                # Wall-clock timeout is not retryable — the agent ran too long
+                _log_timeout_diagnostic(t0, instance_id)
+                return _abort_result(base_sample, "wall_clock_timeout", instance_id)
+
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries and _is_retryable(e):
+                    backoff = 2**attempt
+                    logger.warning(
+                        "[coding_agent_rl] %s: attempt %d/%d failed: %s, retrying in %ds...",
+                        instance_id,
+                        attempt + 1,
+                        max_retries + 1,
+                        e,
+                        backoff,
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                else:
+                    # Non-retryable or exhausted retries
+                    logger.warning(
+                        "[coding_agent_rl] %s: rollout failed after %d attempt(s): %s\n%s",
+                        instance_id,
+                        attempt + 1,
+                        e,
+                        traceback.format_exc(),
+                    )
+                    return _abort_result(base_sample, f"exception:{type(e).__name__}", instance_id)
+
+        # Should never reach here, but for safety
+        return _abort_result(base_sample, f"max_retries_exhausted:{type(last_error).__name__}", instance_id)
+
     finally:
         await state.adapter.drop_session(session_id, wait_timeout=30)  # cleanup only, idempotent
         await asyncio.sleep(10)
