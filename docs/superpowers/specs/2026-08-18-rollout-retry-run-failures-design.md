@@ -102,8 +102,7 @@ for attempt in range(CONFIG.rollout_retries + 1):
         if CONFIG.retry_policy == "always-fail":
             raise
         turns_recorded = state.adapter.manager.has_session(session_id)
-        retryable = _is_retryable(error) or is_fresh_sandbox_retryable(error)
-        if not retryable or attempt >= CONFIG.rollout_retries:
+        if not _is_retryable(error) or attempt >= CONFIG.rollout_retries:
             raise
         if CONFIG.retry_policy == "pre-launch" and turns_recorded:
             raise
@@ -131,11 +130,11 @@ The retry gate is controlled by `SWE_ROLLOUT_RETRY_POLICY` (env var, default `"p
 
 1. **No turns recorded** — `state.adapter.manager.has_session(session_id)` returns `True` iff at least one turn with real prompt messages was recorded. The tree is only created inside `record_turn` at `self._trees.setdefault(sid, MessageNode())` (`trajectory.py:300`), and `record_turn` early-returns on empty prompt before creating the tree (`trajectory.py:292-294`).
 
-2. **Retryable error** — Use the existing example-level `_is_retryable(error)` from `generate.py`, extended with `is_fresh_sandbox_retryable(error)` from the kernel. The example classifier handles `RuntimeError("e2b exec failed...")` from `check=True` execs (boot, install, workspace prep) and network/connection errors. The kernel classifier adds generic `SandboxException` (including those containing `"does not exist"` or `"STOPPED state"`, which a fresh sandbox can recover), E2B transport errors, and other sandbox setup failures. The combined check avoids duplicating logic while preserving existing boot/workspace retry coverage.
+2. **Retryable error** — `_is_retryable(error)` is extended to call `is_fresh_sandbox_retryable(error)` from the kernel at the top, then apply the existing example-specific checks. This combines kernel classification (generic `SandboxException` including `"does not exist"`/`"STOPPED state"`, E2B transport errors) with example-specific checks (`RuntimeError("e2b exec failed...")` from `check=True` execs in boot/install/workspace, network errors). Single source of truth, preserves all existing coverage.
 
-Combined: **retry if no turns recorded AND the error is retryable (example OR kernel classifier); hard-fail otherwise (turns exist, or deterministic error).**
+Combined: **retry if no turns recorded AND `_is_retryable` returns true; hard-fail otherwise (turns exist, or deterministic error).**
 
-**`"retry-from-scratch"` (experimental)** — retry on any retryable error regardless of turns. Drops the partial sid (discarding any already-generated turns and their token cost), opens a fresh sid, and retries from workspace prep. Use when mid-run sandbox instability is more costly than wasted generation. Risks masking real issues by re-rolling.
+**`"retry-from-scratch"` (experimental)** — retry on any retryable error (`_is_retryable` returns true) regardless of turns. Drops the partial sid (discarding any already-generated turns and their token cost), opens a fresh sid, and retries from workspace prep. Use when mid-run sandbox instability is more costly than wasted generation. Risks masking real issues by re-rolling.
 
 **`"always-fail"` (debug)** — never retry; hard-fail on any exception. Use to debug the retry logic itself or force immediate failure for CI.
 
@@ -147,18 +146,46 @@ if retry_policy not in ("pre-launch", "retry-from-scratch", "always-fail"):
     raise ValueError(f"SWE_ROLLOUT_RETRY_POLICY={retry_policy!r} invalid; must be pre-launch|retry-from-scratch|always-fail")
 ```
 
+Extend `_is_retryable` in `generate.py`:
+
+```python
+def _is_retryable(e: Exception) -> bool:
+    """Determine if an exception represents a transient failure worth retrying.
+    
+    Combines kernel classification (is_fresh_sandbox_retryable) with rollout-
+    specific checks for boot/workspace setup failures.
+    """
+    if is_fresh_sandbox_retryable(e):
+        return True
+    
+    # Existing example-specific checks for RuntimeError/network errors
+    msg = str(e).lower()
+    exc_type = type(e).__name__.lower()
+    
+    if "e2b exec failed" in msg or "exit=255" in msg or "exit 255" in msg:
+        return True
+    if "runtimeerror" in exc_type and ("sandbox" in msg or "exec" in msg or "e2b" in msg):
+        return True
+    if any(x in msg for x in ["connection", "timeout", "network", "unavailable"]) and "asyncio" not in exc_type:
+        return True
+    if "boot" in msg or "create" in msg:
+        return True
+    
+    return False
+```
+
 Gate implementation:
 
 ```python
-if retry_policy == "always-fail":
-    raise
-turns_recorded = state.adapter.manager.has_session(session_id)
-retryable = is_fresh_sandbox_retryable(error)
-if not retryable or attempt >= CONFIG.rollout_retries:
-    raise
-if retry_policy == "pre-launch" and turns_recorded:
-    raise
-# retry permitted: drop session if open, backoff, continue
+except Exception as error:
+    if CONFIG.retry_policy == "always-fail":
+        raise
+    turns_recorded = state.adapter.manager.has_session(session_id)
+    if not _is_retryable(error) or attempt >= CONFIG.rollout_retries:
+        raise
+    if CONFIG.retry_policy == "pre-launch" and turns_recorded:
+        raise
+    # retry permitted: drop session if open, backoff, continue
 ```
 
 This makes the policy runtime-switchable without code changes, defaults to the safe "hard-fail after turns" behavior, and leaves the door open for experimenting with mid-run retry under controlled conditions.
@@ -185,7 +212,7 @@ Extend `examples/coding_agent_rl/test_retry.py` with unit tests using a fake ada
 
 1. **Pre-launch retry success** — policy=`"pre-launch"`, `run()` raises a retryable error on attempt 0 (before any turn), `has_session=False` → retry → succeeds on attempt 1. Only the winning sid's samples returned.
 2. **Hard-fail after turns (pre-launch policy)** — policy=`"pre-launch"`, `run()` records a turn, then raises. `has_session=True` → immediate hard-fail, no retry.
-3. **Hard-fail on non-retryable** — `run()` raises a non-retryable error (e.g. `ValueError`) before any turn. `has_session=False` but `is_fresh_sandbox_retryable=False` → immediate hard-fail, no retry.
+3. **Hard-fail on non-retryable** — `run()` raises a non-retryable error (e.g. `ValueError`) before any turn. `has_session=False` but `_is_retryable=False` → immediate hard-fail, no retry.
 4. **Exhaust retries** — all attempts fail pre-launch (retryable) → abort after `rollout_retries+1`, each failed sid dropped (store clean).
 5. **Fresh sid per attempt** — verify sids are `{base}-a0`, `{base}-a1`, ... and `base_sample.session_id` ends as the winning sid.
 6. **Retry-from-scratch policy** — policy=`"retry-from-scratch"`, `run()` records a turn, then raises retryable error → drops partial sid, retries with fresh sid. Verify the partial tree is discarded.
