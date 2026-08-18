@@ -94,12 +94,25 @@ def test_not_fresh_retryable_timeout():
 
 
 def test_not_fresh_retryable_generic_sandbox_exception():
-    """A SandboxException without stopped/missing text is NOT fresh-retryable
-    (unknown error — preserve existing behaviour)."""
+    """A SandboxException carrying a permanent auth/quota marker ("quota") is
+    NOT fresh-retryable: a fresh sandbox cannot recover a quota failure."""
     e = _exc("SandboxException", "quota exceeded")
-    # quota exceeded is NOT a fresh-retryable infra failure
-    # (sandbox still exists, retrying won't help)
+    # "quota exceeded" matches the permanent marker "quota", so it stays False.
     assert not sandbox_mod.is_fresh_sandbox_retryable(e)
+
+
+def test_fresh_retryable_generic_transient_sandbox_exception():
+    """A generic SandboxException (transient gateway) IS fresh-sandbox retryable
+    now that grader execs bypass same-sandbox retry."""
+    e = _exc("SandboxException", "gateway timeout talking to sandbox service")
+    assert sandbox_mod.is_fresh_sandbox_retryable(e)
+
+
+def test_not_fresh_retryable_permanent_auth_sandbox_exception():
+    """Permanent auth/quota SandboxExceptions are NOT retried."""
+    for msg in ("401 Unauthorized", "quota exceeded", "invalid API key", "billing required"):
+        e = _exc("SandboxException", msg)
+        assert not sandbox_mod.is_fresh_sandbox_retryable(e), msg
 
 
 def test_same_sandbox_stopped_not_retried():
