@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-18  
 **Status:** Approved  
-**Scope:** `slime/agent/sandbox.py` (kernel), `examples/coding_agent_rl/generate.py` (example)
+**Scope:** `slime/agent/sandbox.py` (kernel), `examples/coding_agent_rl/generate.py` (example), `examples/coding_agent_rl/README.md` (documentation)
 
 ## Problem
 
@@ -102,7 +102,7 @@ for attempt in range(CONFIG.rollout_retries + 1):
         if CONFIG.retry_policy == "always-fail":
             raise
         turns_recorded = state.adapter.manager.has_session(session_id)
-        retryable = is_fresh_sandbox_retryable(error)
+        retryable = _is_retryable(error) or is_fresh_sandbox_retryable(error)
         if not retryable or attempt >= CONFIG.rollout_retries:
             raise
         if CONFIG.retry_policy == "pre-launch" and turns_recorded:
@@ -131,11 +131,11 @@ The retry gate is controlled by `SWE_ROLLOUT_RETRY_POLICY` (env var, default `"p
 
 1. **No turns recorded** — `state.adapter.manager.has_session(session_id)` returns `True` iff at least one turn with real prompt messages was recorded. The tree is only created inside `record_turn` at `self._trees.setdefault(sid, MessageNode())` (`trajectory.py:300`), and `record_turn` early-returns on empty prompt before creating the tree (`trajectory.py:292-294`).
 
-2. **Retryable error** — `is_fresh_sandbox_retryable(error)` from `slime.agent.sandbox` is the existing kernel API for classifying errors that warrant a fresh-sandbox retry. It correctly recognizes generic `SandboxException` (unless containing `"does not exist"` or `"STOPPED state"`), E2B RPC transport errors, and sandbox setup failures. Reusing this avoids duplicating classification logic and prevents retrying deterministic errors (config mistakes, programming errors) that would never succeed.
+2. **Retryable error** — Use the existing example-level `_is_retryable(error)` from `generate.py`, extended with `is_fresh_sandbox_retryable(error)` from the kernel. The example classifier handles `RuntimeError("e2b exec failed...")` from `check=True` execs (boot, install, workspace prep) and network/connection errors. The kernel classifier adds generic `SandboxException` (including those containing `"does not exist"` or `"STOPPED state"`, which a fresh sandbox can recover), E2B transport errors, and other sandbox setup failures. The combined check avoids duplicating logic while preserving existing boot/workspace retry coverage.
 
-Combined: **retry if no turns recorded AND the error is fresh-sandbox retryable; hard-fail otherwise (turns exist, or deterministic error).**
+Combined: **retry if no turns recorded AND the error is retryable (example OR kernel classifier); hard-fail otherwise (turns exist, or deterministic error).**
 
-**`"retry-from-scratch"` (experimental)** — retry on any retryable error regardless of turns. Drops the partial sid (discarding any already-generated turns and their token cost), opens a fresh sid, and retries from workspace prep. Use when mid-run instability (sandbox crashes, eval flakes) is more costly than wasted generation. Risks masking real issues by re-rolling.
+**`"retry-from-scratch"` (experimental)** — retry on any retryable error regardless of turns. Drops the partial sid (discarding any already-generated turns and their token cost), opens a fresh sid, and retries from workspace prep. Use when mid-run sandbox instability is more costly than wasted generation. Risks masking real issues by re-rolling.
 
 **`"always-fail"` (debug)** — never retry; hard-fail on any exception. Use to debug the retry logic itself or force immediate failure for CI.
 
@@ -205,8 +205,9 @@ The existing tests check that *some* `run-*.sh` was written but don't assert loc
 
 ### In Scope
 
-- **Launcher path change** (`slime/agent/sandbox.py`) — kernel change, but minimal (one path derivation + one `mkdir`), well-justified, fixes a real concurrency bug. Aligns with CONTRIBUTING "bug fixes and optimizations."
-- **Rollout retry widening** (`examples/coding_agent_rl/generate.py`) — example-only, no kernel surface.
+- **Launcher path change** (`slime/agent/sandbox.py`) — kernel change, but minimal (home derivation + `mkdir` for all four artifact paths), well-justified, fixes a real concurrency bug. Aligns with CONTRIBUTING "bug fixes and optimizations."
+- **Rollout retry widening** (`examples/coding_agent_rl/generate.py`) — example-only, no kernel surface. Extends existing `_is_retryable` with kernel `is_fresh_sandbox_retryable` to preserve boot/workspace retry coverage.
+- **Configuration documentation** (`examples/coding_agent_rl/README.md`) — add `SWE_ROLLOUT_RETRY_POLICY` to the configuration table (line ~152), document the three policy values and their interaction with `SWE_ROLLOUT_RETRIES`.
 
 ### Known Limitations
 
@@ -238,6 +239,7 @@ The existing tests check that *some* `run-*.sh` was written but don't assert loc
 ## Summary
 
 - **Primary fix:** Move all internally managed `exec_and_wait` artifacts (`launcher`, `done_file`, `lock_dir`, default `out_file`) from `/tmp` to user home (`~/tmp` for non-root, `/root/tmp` for root). Sidesteps the `/tmp` readiness race under high-concurrency launches. Caller-provided `out_file` paths honored unchanged.
-- **Backstop:** Widen rollout retry to cover `run()`, gated on policy (`SWE_ROLLOUT_RETRY_POLICY`, default `"pre-launch"`) + `is_fresh_sandbox_retryable` (error classification). Fresh sid per attempt avoids `closed`-poisoning; only the winning sid reaches training. Default policy hard-fails after turns; `"retry-from-scratch"` enables mid-run retry (experimental); `"always-fail"` disables retry (debug).
+- **Backstop:** Widen rollout retry to cover `run()`, gated on policy (`SWE_ROLLOUT_RETRY_POLICY`, default `"pre-launch"`) + error classification (existing `_is_retryable` OR kernel `is_fresh_sandbox_retryable`). Fresh sid per attempt avoids `closed`-poisoning; only the winning sid reaches training. Default policy hard-fails after turns; `"retry-from-scratch"` enables mid-run retry (experimental); `"always-fail"` disables retry (debug).
 - **Testing:** Unit tests for retry logic (fake adapter) covering all three policies + non-retryable hard-fail + invalid policy; explicit path assertions for agent/root launcher locations in harness tests.
-- **Scope:** One minimal kernel change (`sandbox.py`), one example change (`generate.py`) + config parsing. No new abstractions, no upstream-sensitive refactors.
+- **Documentation:** Add `SWE_ROLLOUT_RETRY_POLICY` to `examples/coding_agent_rl/README.md` configuration table with policy descriptions.
+- **Scope:** One minimal kernel change (`sandbox.py`), one example change (`generate.py`) + config parsing, one README update. No new abstractions, no upstream-sensitive refactors.
