@@ -95,7 +95,7 @@ def test_not_fresh_retryable_timeout():
     assert not sandbox_mod.is_fresh_sandbox_retryable(asyncio.TimeoutError())
 
 
-def test_not_fresh_retryable_generic_sandbox_exception():
+def test_not_fresh_retryable_permanent_marker_sandbox_exception():
     """A SandboxException carrying a permanent auth/quota marker ("quota") is
     NOT fresh-retryable: a fresh sandbox cannot recover a quota failure."""
     e = _exc("SandboxException", "quota exceeded")
@@ -281,8 +281,11 @@ def test_cancelled_error_not_swallowed():
     assert call_count == 1
 
 
-def test_max_attempts_one_preserves_single_attempt_behavior():
-    """max_attempts=1 (old default) means one call, exception propagates."""
+def test_max_attempts_one_single_attempt():
+    """max_attempts=1 makes exactly one evaluation attempt; a retryable
+    infrastructure error still propagates (no fresh-sandbox retry). This is not
+    byte-identical to pre-retry behaviour — grader execs are now non-idempotent —
+    but the attempt count is one."""
     call_count = 0
 
     async def fake_once(md, diff_text, timeout_sec):
