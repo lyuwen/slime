@@ -51,9 +51,9 @@ class Sandbox(Protocol):
     ``write_file`` accepts either in-memory content (``str``/``bytes``) or a
     host ``Path`` to stream into the sandbox.
 
-    Retry/idempotency is deliberately *not* part of this contract: whether a
-    severed RPC is safe to re-send is a backend transport concern (see
-    ``E2BSandbox._rpc_retry``), not something abstraction consumers reason about.
+    ``exec``'s ``idempotent`` flag is an advisory hint: it tells a backend that
+    re-sending the RPC after a severed response is (un)safe. A backend with no
+    same-sandbox retry (see ``E2BSandbox._rpc_retry``) may simply ignore it.
     """
 
     sandbox_id: str
@@ -70,6 +70,7 @@ class Sandbox(Protocol):
         env: dict[str, str] | None = None,
         timeout: int = 120,
         check: bool = False,
+        idempotent: bool = True,
     ) -> ExecResult: ...
 
     async def write_file(self, sandbox_path: str, content: FileContent, *, user: str = "root") -> None: ...
@@ -423,6 +424,63 @@ class E2BSandbox:
             )
         except Exception:
             return ""
+
+
+# Substrings marking a *permanent* provider SandboxException — auth/quota/billing
+# failures a fresh sandbox cannot recover. Matched case-insensitively against the
+# exception message. Everything else generic is treated as a transient gateway
+# error and IS fresh-sandbox retryable (spec §Failure classification).
+_PERMANENT_SANDBOX_ERROR_MARKERS = (
+    "unauthorized",
+    "forbidden",
+    "invalid api key",
+    "invalid_api_key",
+    "authentication",
+    "quota",
+    "payment",
+    "billing",
+    "insufficient funds",
+)
+
+
+def is_fresh_sandbox_retryable(e: BaseException) -> bool:
+    """True when ``e`` is an infrastructure exception safe to recover by
+    recreating the evaluator sandbox from scratch.
+
+    Relative to :meth:`E2BSandbox._is_transient_rpc_error` this predicate
+    additionally treats ``SandboxException`` failures indicating the sandbox
+    no longer exists or is stopped as retryable (a fresh sandbox recovers
+    them even though same-sandbox RPC retry cannot). A *generic*
+    ``SandboxException`` is treated as a transient provider/gateway error and
+    IS fresh-retryable — grader execs run with ``idempotent=False`` and so
+    bypass same-sandbox retry, making this the only recovery layer. The one
+    exception is a denylist of permanent auth/quota/billing markers
+    (``_PERMANENT_SANDBOX_ERROR_MARKERS``), which a fresh sandbox cannot
+    recover and which therefore return ``False``.
+
+    Does NOT include ``asyncio.CancelledError`` or ``asyncio.TimeoutError``
+    so the outer rollout wall-clock guard is never swallowed.
+    """
+    if isinstance(e, (asyncio.CancelledError, asyncio.TimeoutError)):
+        return False
+    name = type(e).__name__
+    if name in E2BSandbox._TRANSIENT_RPC_ERRORS:
+        return True
+    if name == "SandboxException":
+        msg = str(e)
+        # Stopped / missing sandbox: a new sandbox recovers this. (Same-sandbox
+        # RPC retry deliberately does NOT — see _is_transient_rpc_error.)
+        if "does not exist" in msg or "STOPPED state" in msg:
+            return True
+        # Known permanent auth/quota/billing failures: a fresh sandbox cannot
+        # recover these, so do not retry.
+        low = msg.lower()
+        if any(marker in low for marker in _PERMANENT_SANDBOX_ERROR_MARKERS):
+            return False
+        # Otherwise treat as a transient provider/gateway error: recoverable by
+        # recreating the evaluator sandbox.
+        return True
+    return False
 
 
 async def ensure_agent_user(sb: Sandbox, workdir: str) -> None:

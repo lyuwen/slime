@@ -68,6 +68,7 @@ class SweConfig:
     fork_merge_threshold: int | None
     agent_time_budget_sec: int
     eval_timeout_sec: int
+    eval_max_attempts: int  # NEW — SWE_EVAL_MAX_ATTEMPTS
     rollout_guard_sec: int
     boot_concurrency: int
     boot_retries: int
@@ -81,7 +82,13 @@ class SweConfig:
     def from_env(cls) -> SweConfig:
         agent_time_budget = int(os.environ.get("SWE_AGENT_TIME_BUDGET_SEC", "1800"))
         eval_timeout = int(os.environ.get("SWE_EVAL_TIMEOUT_SEC", "600"))
-        guard = int(os.environ.get("SWE_ROLLOUT_GUARD_SEC", "0") or 0) or (agent_time_budget + eval_timeout + 180)
+        _raw_max_attempts = int(os.environ.get("SWE_EVAL_MAX_ATTEMPTS", "2"))
+        if _raw_max_attempts < 1:
+            raise ValueError(f"SWE_EVAL_MAX_ATTEMPTS must be >= 1, got {_raw_max_attempts!r}")
+        eval_max_attempts = _raw_max_attempts
+        guard = int(os.environ.get("SWE_ROLLOUT_GUARD_SEC", "0") or 0) or (
+            agent_time_budget + eval_timeout * eval_max_attempts + 180
+        )
         fork = int(v) if (v := os.environ.get("SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS")) else None
         oh_tools_raw = os.environ.get("SWE_OH_TOOLS", "file_editor,terminal,task_tracker,think,finish")
         oh_tools = [t.strip() for t in oh_tools_raw.split(",") if t.strip()]
@@ -101,6 +108,7 @@ class SweConfig:
             fork_merge_threshold=fork,
             agent_time_budget_sec=agent_time_budget,
             eval_timeout_sec=eval_timeout,
+            eval_max_attempts=eval_max_attempts,
             rollout_guard_sec=guard,
             boot_concurrency=int(os.environ.get("SWE_BOOT_CONCURRENCY", "16")),
             boot_retries=int(os.environ.get("SWE_BOOT_RETRIES", "2")),
@@ -388,6 +396,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 md,
                 diff_text=diff_text,
                 timeout_sec=CONFIG.eval_timeout_sec,
+                max_attempts=CONFIG.eval_max_attempts,
             )
             if traj_data is not None:
                 _persist_trajectory(
