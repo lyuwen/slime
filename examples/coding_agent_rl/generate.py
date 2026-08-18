@@ -73,6 +73,7 @@ class SweConfig:
     boot_concurrency: int
     boot_retries: int
     rollout_retries: int
+    retry_policy: str
     oh_fake_user: bool
     oh_max_iterations: int
     oh_tools: list[str]
@@ -99,6 +100,12 @@ class SweConfig:
         rollout_retries = int(os.environ.get("SWE_ROLLOUT_RETRIES", "2"))
         if rollout_retries < 0:
             raise ValueError("SWE_ROLLOUT_RETRIES must be non-negative")
+        retry_policy = os.environ.get("SWE_ROLLOUT_RETRY_POLICY", "pre-launch")
+        if retry_policy not in ("pre-launch", "retry-from-scratch", "always-fail"):
+            raise ValueError(
+                f"SWE_ROLLOUT_RETRY_POLICY={retry_policy!r} invalid; "
+                f"must be pre-launch|retry-from-scratch|always-fail"
+            )
         return cls(
             eval_protocol=os.environ.get("SWE_EVAL_PROTOCOL", swe.PROTOCOL_SCALESWE),
             train_protocol=os.environ.get("SWE_TRAIN_PROTOCOL", swe.PROTOCOL_SCALESWE),
@@ -113,6 +120,7 @@ class SweConfig:
             boot_concurrency=int(os.environ.get("SWE_BOOT_CONCURRENCY", "16")),
             boot_retries=int(os.environ.get("SWE_BOOT_RETRIES", "2")),
             rollout_retries=rollout_retries,
+            retry_policy=retry_policy,
             oh_fake_user=os.environ.get("SWE_OH_FAKE_USER", "0") not in ("0", "", "false", "False"),
             oh_max_iterations=int(os.environ.get("SWE_OH_MAX_ITERATIONS", "100")),
             oh_tools=oh_tools,

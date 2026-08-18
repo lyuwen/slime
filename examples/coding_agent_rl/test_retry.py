@@ -96,6 +96,37 @@ def test_retry_config_rejects_non_integer_value():
             SweConfig.from_env()
 
 
+def test_retry_policy_default():
+    import os
+
+    os.environ.pop("SWE_ROLLOUT_RETRY_POLICY", None)
+    try:
+        assert SweConfig.from_env().retry_policy == "pre-launch"
+    finally:
+        os.environ.pop("SWE_ROLLOUT_RETRY_POLICY", None)
+
+
+def test_retry_policy_custom():
+    import os
+
+    os.environ["SWE_ROLLOUT_RETRY_POLICY"] = "retry-from-scratch"
+    try:
+        assert SweConfig.from_env().retry_policy == "retry-from-scratch"
+    finally:
+        os.environ.pop("SWE_ROLLOUT_RETRY_POLICY", None)
+
+
+def test_retry_policy_invalid():
+    import os
+
+    os.environ["SWE_ROLLOUT_RETRY_POLICY"] = "invalid-policy"
+    try:
+        with pytest.raises(ValueError, match="SWE_ROLLOUT_RETRY_POLICY.*invalid"):
+            SweConfig.from_env()
+    finally:
+        os.environ.pop("SWE_ROLLOUT_RETRY_POLICY", None)
+
+
 # ---------------------------------------------------------------------------
 # generate() retry loop — integration tests with mocked E2B
 # ---------------------------------------------------------------------------
