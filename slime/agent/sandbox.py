@@ -425,6 +425,34 @@ class E2BSandbox:
             return ""
 
 
+def is_fresh_sandbox_retryable(e: BaseException) -> bool:
+    """True when ``e`` is an infrastructure exception safe to recover by
+    recreating the evaluator sandbox from scratch.
+
+    This is a superset of :meth:`E2BSandbox._is_transient_rpc_error`:
+    it additionally includes ``SandboxException`` failures that indicate
+    the sandbox no longer exists or is stopped, because a fresh sandbox
+    can recover them even though same-sandbox RPC retry cannot.
+
+    Does NOT include ``asyncio.CancelledError`` or ``asyncio.TimeoutError``
+    so the outer rollout wall-clock guard is never swallowed.
+    """
+    if isinstance(e, (asyncio.CancelledError, asyncio.TimeoutError)):
+        return False
+    name = type(e).__name__
+    if name in E2BSandbox._TRANSIENT_RPC_ERRORS:
+        return True
+    if name == "SandboxException":
+        msg = str(e)
+        # stopped / missing sandbox: a new sandbox will recover this
+        if "does not exist" in msg or "STOPPED state" in msg:
+            return True
+        # any other SandboxException (quota, auth, ...) is not recoverable
+        # by retrying — propagate as-is.
+        return False
+    return False
+
+
 async def ensure_agent_user(sb: Sandbox, workdir: str) -> None:
     """Create the unprivileged 'agent' user that owns workdir + can git diff."""
     await sb.exec(
