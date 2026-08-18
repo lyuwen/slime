@@ -498,3 +498,54 @@ def test_success_after_retry_emits_info_log(caplog):
     info_texts = [r.message for r in caplog.records if r.levelno == logging.INFO]
     assert any("inst-log" in t for t in info_texts), "instance_id missing from success info log"
     assert any("2" in t for t in info_texts), "attempt count missing from success info log"
+
+
+# ---------------------------------------------------------------------------
+# §6  grader execs are non-idempotent (spec: no same-sandbox grader re-run)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingSandbox:
+    """Minimal Sandbox stand-in that records each exec's idempotent flag."""
+
+    sandbox_id = "rec-1"
+
+    def __init__(self):
+        self.execs = []  # list of (cmd, idempotent)
+
+    async def exec(self, cmd, *, user="root", env=None, timeout=120, check=False, idempotent=True):
+        self.execs.append((cmd, idempotent))
+        return (0, "", "")
+
+    async def write_file(self, path, content, *, user="root"):
+        return None
+
+    async def read_file(self, path, *, user="root"):
+        return ""
+
+
+def test_eval_cmd_grader_exec_is_non_idempotent():
+    """The eval_cmd grading command must be marked idempotent=False so the
+    same-sandbox RPC retry loop never re-runs the grader after a stream break."""
+    ev = _RecordingSandbox()
+
+    async def run():
+        return await swe_mod._run_eval_cmd(ev, "/workspace/repo", "pytest -x", timeout=30)
+
+    asyncio.run(run())
+    grading_execs = [(cmd, idem) for cmd, idem in ev.execs if "pytest -x" in cmd]
+    assert grading_execs, "grading command was never exec'd"
+    assert all(idem is False for _cmd, idem in grading_execs), "grader exec must be idempotent=False"
+
+
+def test_f2p_grader_exec_is_non_idempotent():
+    """The f2p_script pytest run must be idempotent=False."""
+    ev = _RecordingSandbox()
+
+    async def run():
+        return await swe_mod._run_f2p_script(ev, "/workspace/repo", "import sys, pytest; sys.exit(0)", timeout=30)
+
+    asyncio.run(run())
+    grading_execs = [(cmd, idem) for cmd, idem in ev.execs if "python" in cmd and "__cagent_f2p__" in cmd]
+    assert grading_execs, "f2p grading command was never exec'd"
+    assert all(idem is False for _cmd, idem in grading_execs), "f2p grader exec must be idempotent=False"

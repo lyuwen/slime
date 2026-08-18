@@ -416,6 +416,7 @@ async def _run_swepro(ev: Sandbox, workdir: str, swepro: dict, timeout: int) -> 
         user="agent",
         check=False,
         timeout=timeout,
+        idempotent=False,
     )
     await ev.exec(
         f"python3 {_SWEPRO_DIR}/parser.py {stdout_f} {stderr_f} {result_f}",
@@ -432,7 +433,7 @@ async def _run_swepro(ev: Sandbox, workdir: str, swepro: dict, timeout: int) -> 
 
 
 async def _run_eval_cmd(ev: Sandbox, workdir: str, cmd: str, timeout: int) -> float:
-    ec, _, _ = await ev.exec(f"cd {workdir} && {cmd}", user="agent", check=False, timeout=timeout)
+    ec, _, _ = await ev.exec(f"cd {workdir} && {cmd}", user="agent", check=False, timeout=timeout, idempotent=False)
     return 1.0 if ec == 0 else 0.0
 
 
@@ -441,7 +442,9 @@ async def _run_f2p_script(ev: Sandbox, workdir: str, script: str, timeout: int) 
     # `sys.exit(pytest.main([...]))`; write it verbatim (no shell quoting) and
     # let python's exit code carry the pass/fail signal.
     await ev.write_file(_F2P, script, user="agent")
-    ec, _, _ = await ev.exec(f"cd {workdir} && python {_F2P}", user="agent", check=False, timeout=timeout)
+    ec, _, _ = await ev.exec(
+        f"cd {workdir} && python {_F2P}", user="agent", check=False, timeout=timeout, idempotent=False
+    )
     return 1.0 if ec == 0 else 0.0
 
 

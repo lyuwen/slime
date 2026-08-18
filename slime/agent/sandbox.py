@@ -429,10 +429,13 @@ def is_fresh_sandbox_retryable(e: BaseException) -> bool:
     """True when ``e`` is an infrastructure exception safe to recover by
     recreating the evaluator sandbox from scratch.
 
-    This is a superset of :meth:`E2BSandbox._is_transient_rpc_error`:
-    it additionally includes ``SandboxException`` failures that indicate
-    the sandbox no longer exists or is stopped, because a fresh sandbox
-    can recover them even though same-sandbox RPC retry cannot.
+    Relative to :meth:`E2BSandbox._is_transient_rpc_error` this predicate
+    additionally treats ``SandboxException`` failures indicating the sandbox
+    no longer exists or is stopped as retryable (a fresh sandbox recovers
+    them even though same-sandbox RPC retry cannot). It intentionally
+    diverges in the other direction on a *generic* ``SandboxException``
+    (e.g. quota/auth): same-sandbox retry treats it as transient, but a new
+    sandbox cannot recover it, so this predicate returns ``False``.
 
     Does NOT include ``asyncio.CancelledError`` or ``asyncio.TimeoutError``
     so the outer rollout wall-clock guard is never swallowed.
