@@ -65,6 +65,25 @@ def test_not_retryable_generic_runtime_error():
     assert not _is_retryable(RuntimeError("division by zero"))
 
 
+class SandboxException(Exception):
+    """Stand-in matching the kernel classifier's name-based check
+    (is_fresh_sandbox_retryable matches on type(e).__name__)."""
+
+
+def test_is_retryable_kernel_sandbox_exception():
+    # Generic SandboxException is classified as fresh-retryable by the kernel.
+    assert _is_retryable(SandboxException("500: error creating file: ... permission denied"))
+
+
+def test_is_retryable_example_runtime_error():
+    # Example-specific check: RuntimeError from a check=True exec.
+    assert _is_retryable(RuntimeError("e2b exec failed exit=255"))
+
+
+def test_is_retryable_non_retryable():
+    assert not _is_retryable(ValueError("invalid config"))
+
+
 def test_retry_config_rejects_negative_value():
     with patch.dict("os.environ", {"SWE_ROLLOUT_RETRIES": "-1"}):
         with pytest.raises(ValueError, match="must be non-negative"):

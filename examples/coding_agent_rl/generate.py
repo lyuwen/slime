@@ -37,7 +37,7 @@ from jinja2 import Environment, FileSystemLoader, TemplateError
 from slime.agent.adapters import AnthropicAdapter, OpenAIAdapter
 from slime.agent.aiohttp_threaded import FilteredAccessLogger, run_app_in_thread
 from slime.agent.harness import ClaudeCodeHarness, CodexHarness, OpenHandsHarness
-from slime.agent.sandbox import E2BSandbox
+from slime.agent.sandbox import E2BSandbox, is_fresh_sandbox_retryable
 from slime.utils.misc import SingletonMeta
 from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
@@ -304,6 +304,11 @@ def _is_retryable(e: Exception) -> bool:
     certain network/sandbox errors. Non-retryable errors include dataset
     issues, adapter problems, and application logic failures.
     """
+    # Kernel classifier is the single source of truth for generic
+    # SandboxException / E2B transport errors. Consult it first.
+    if is_fresh_sandbox_retryable(e):
+        return True
+
     msg = str(e).lower()
     exc_type = type(e).__name__.lower()
 
