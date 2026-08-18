@@ -433,3 +433,68 @@ def test_explicit_guard_not_overridden():
     ):
         cfg = gen_mod.SweConfig.from_env()
     assert cfg.rollout_guard_sec == 9999
+
+
+# ---------------------------------------------------------------------------
+# §5  Logging during retry
+# ---------------------------------------------------------------------------
+
+
+def test_retry_warning_contains_instance_and_attempt(caplog):
+    """The retry warning must include instance_id, attempt number, and exception type."""
+    import logging
+
+    call_count = 0
+
+    async def fake_once(md, diff_text, timeout_sec):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise _exc("ReadError", "connection reset")
+        return swe_mod.EvalResult(1.0, True)
+
+    async def run():
+        with patch.object(swe_mod, "_run_evaluation_once", fake_once):
+            with caplog.at_level(logging.WARNING, logger="examples.coding_agent_rl.swe"):
+                return await swe_mod.run_evaluation(
+                    {"protocol": "scaleswe", "instance_id": "astropy_pr44"},
+                    diff_text="diff",
+                    timeout_sec=10,
+                    max_attempts=2,
+                )
+
+    asyncio.run(run())
+    warning_texts = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("astropy_pr44" in t for t in warning_texts), "instance_id missing from warning"
+    assert any("1/2" in t for t in warning_texts), "attempt count missing from warning"
+    assert any("ReadError" in t for t in warning_texts), "exception type missing from warning"
+    assert any("fresh evaluator sandbox" in t for t in warning_texts), "fresh sandbox note missing"
+
+
+def test_success_after_retry_emits_info_log(caplog):
+    """After recovering via retry, an info log must record total attempts and reward."""
+    import logging
+
+    call_count = 0
+
+    async def fake_once(md, diff_text, timeout_sec):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise _exc("ReadError", "blip")
+        return swe_mod.EvalResult(1.0, True)
+
+    async def run():
+        with patch.object(swe_mod, "_run_evaluation_once", fake_once):
+            with caplog.at_level(logging.INFO, logger="examples.coding_agent_rl.swe"):
+                return await swe_mod.run_evaluation(
+                    {"protocol": "scaleswe", "instance_id": "inst-log"},
+                    diff_text="",
+                    timeout_sec=10,
+                    max_attempts=2,
+                )
+
+    asyncio.run(run())
+    info_texts = [r.message for r in caplog.records if r.levelno == logging.INFO]
+    assert any("inst-log" in t for t in info_texts), "instance_id missing from success info log"
+    assert any("2" in t for t in info_texts), "attempt count missing from success info log"

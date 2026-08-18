@@ -287,7 +287,16 @@ async def run_evaluation(
     last_err: BaseException | None = None
     for attempt in range(1, max_attempts + 1):
         try:
-            return await _run_evaluation_once(md, diff_text, timeout_sec)
+            result = await _run_evaluation_once(md, diff_text, timeout_sec)
+            if attempt > 1:
+                logger.info(
+                    "[swe] %s: eval succeeded on attempt %d/%d reward=%.2f",
+                    md.get("instance_id", "?"),
+                    attempt,
+                    max_attempts,
+                    float(result.reward),
+                )
+            return result
         except (asyncio.CancelledError, asyncio.TimeoutError):
             raise  # never swallow cancellation or the outer wall-clock guard
         except BaseException as e:
