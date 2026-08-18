@@ -478,7 +478,6 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             await asyncio.sleep(10)
 
 
-
 def _log_timeout_diagnostic(t0: float, instance_id: str) -> None:
     # Dump pending-task names when the wall-clock guard fires. Must not crash.
     try:

@@ -170,9 +170,7 @@ async def test_retry_succeeds_on_second_attempt(base_patches):
     from examples.coding_agent_rl.generate import generate
 
     mock_swe = base_patches["mock_swe"]
-    mock_swe.prepare_workspace = AsyncMock(
-        side_effect=[RuntimeError("e2b exec failed (exit=255): useradd"), None]
-    )
+    mock_swe.prepare_workspace = AsyncMock(side_effect=[RuntimeError("e2b exec failed (exit=255): useradd"), None])
 
     sleep_calls = []
 
@@ -197,9 +195,7 @@ async def test_retry_exhausted_returns_abort(base_patches):
     from examples.coding_agent_rl.generate import generate
 
     mock_swe = base_patches["mock_swe"]
-    mock_swe.prepare_workspace = AsyncMock(
-        side_effect=RuntimeError("e2b exec failed (exit=255): persistent")
-    )
+    mock_swe.prepare_workspace = AsyncMock(side_effect=RuntimeError("e2b exec failed (exit=255): persistent"))
 
     sleep_calls = []
 
@@ -254,9 +250,7 @@ async def test_no_cleanup_when_setup_never_opens_session(base_patches):
     """Setup exhaustion does not drop a session that was never opened."""
     from examples.coding_agent_rl.generate import generate
 
-    base_patches["mock_swe"].prepare_workspace = AsyncMock(
-        side_effect=RuntimeError("e2b exec failed (exit=255)")
-    )
+    base_patches["mock_swe"].prepare_workspace = AsyncMock(side_effect=RuntimeError("e2b exec failed (exit=255)"))
 
     async def fast_sleep(n):
         pass
