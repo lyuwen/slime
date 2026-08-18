@@ -242,6 +242,42 @@ async def test_retry_succeeds_on_second_attempt(base_patches):
 
 
 @pytest.mark.anyio
+async def test_generate_sets_winning_sid_with_attempt_suffix(base_patches):
+    """Real generate(): first attempt fails retryably after open, second succeeds.
+
+    Asserts the REAL retry loop stamps base_sample.session_id with the winning
+    attempt's ``-a{N}`` suffix (not the inline FakeAdapter copy). ``_session_id``
+    is patched to "sess-123" in base_patches, so the winning sid after the
+    second attempt is "sess-123-a1". The first attempt fails inside the harness
+    run (after open_session) with a retryable error and no turns recorded
+    (has_session=False), so the per-attempt sessions "-a0" (opened then dropped)
+    and "-a1" (winning) are both observable.
+    """
+    from examples.coding_agent_rl.generate import generate
+
+    mock_swe = base_patches["mock_swe"]
+    mock_swe.prepare_workspace = AsyncMock()
+    base_patches["mock_harness_inst"].run = AsyncMock(
+        side_effect=[RuntimeError("e2b exec failed (exit=255): mid-launch"), 0]
+    )
+
+    async def fast_sleep(_):
+        pass
+
+    sample = _make_sample_mock()
+    with patch("examples.coding_agent_rl.generate.asyncio.sleep", side_effect=fast_sleep):
+        await generate(MagicMock(), sample, {})
+
+    # Second attempt won → winning sid carries the -a1 suffix.
+    assert sample.session_id == "sess-123-a1"
+    # Per-attempt sids advance a0 → a1; the failed a0 session is dropped.
+    open_sids = [c.args[0] for c in base_patches["state"].adapter.open_session.call_args_list]
+    assert open_sids == ["sess-123-a0", "sess-123-a1"]
+    drop_sids = [c.args[0] for c in base_patches["state"].adapter.drop_session.await_args_list]
+    assert "sess-123-a0" in drop_sids
+
+
+@pytest.mark.anyio
 async def test_retry_exhausted_returns_abort(base_patches):
     """All attempts fail with retryable error — abort after max_retries+1 tries."""
     from examples.coding_agent_rl.generate import generate
