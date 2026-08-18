@@ -314,3 +314,122 @@ def test_scaleswe_and_swebench_both_use_retry_boundary():
 
     asyncio.run(run())
     assert results == ["scaleswe", "swebench"]
+
+
+# ---------------------------------------------------------------------------
+# §3  SweConfig env-var parsing
+# ---------------------------------------------------------------------------
+
+import os  # noqa: E402
+import types  # noqa: E402
+
+# Importing generate pulls in transformers via slime.utils.processing_utils and
+# uses asyncio.timeout() (3.11+). Stub/shim both so the import resolves on the
+# CPU-only 3.10 CI env (mirrors tests/test_agent/test_agent_rollout_cpu.py).
+if "transformers" not in sys.modules:
+    _tf_stub = types.ModuleType("transformers")
+    for _name in ("AutoProcessor", "AutoTokenizer", "PreTrainedTokenizerBase", "ProcessorMixin"):
+        setattr(_tf_stub, _name, type(_name, (), {}))
+    sys.modules["transformers"] = _tf_stub
+
+if not hasattr(asyncio, "timeout"):
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def _timeout_shim(_delay):
+        yield
+
+    asyncio.timeout = _timeout_shim
+
+import examples.coding_agent_rl.generate as gen_mod  # noqa: E402
+
+
+def _make_config(**env_overrides):
+    """Build a SweConfig.from_env() with selective env overrides."""
+    base = {
+        "SWE_AGENT_TIME_BUDGET_SEC": "1800",
+        "SWE_EVAL_TIMEOUT_SEC": "600",
+        "ADAPTER_PUBLIC_HOST": "127.0.0.1",
+    }
+    base.update(env_overrides)
+    with patch.dict(os.environ, base, clear=False):
+        # Unset guard so it is derived, unless caller sets it explicitly.
+        env = {**base}
+        if "SWE_ROLLOUT_GUARD_SEC" not in env_overrides:
+            env.pop("SWE_ROLLOUT_GUARD_SEC", None)
+        with patch.dict(os.environ, env, clear=False):
+            # Remove guard if not explicitly set so derived formula applies.
+            saved = os.environ.pop("SWE_ROLLOUT_GUARD_SEC", None)
+            try:
+                return gen_mod.SweConfig.from_env()
+            finally:
+                if saved is not None:
+                    os.environ["SWE_ROLLOUT_GUARD_SEC"] = saved
+
+
+def test_default_eval_max_attempts_is_two():
+    cfg = _make_config()
+    assert cfg.eval_max_attempts == 2
+
+
+def test_eval_max_attempts_parsed_from_env():
+    cfg = _make_config(SWE_EVAL_MAX_ATTEMPTS="4")
+    assert cfg.eval_max_attempts == 4
+
+
+def test_eval_max_attempts_one_is_valid():
+    cfg = _make_config(SWE_EVAL_MAX_ATTEMPTS="1")
+    assert cfg.eval_max_attempts == 1
+
+
+def test_eval_max_attempts_zero_raises():
+    """Values below 1 must fail configuration parsing early."""
+    with pytest.raises((ValueError, SystemExit)):
+        _make_config(SWE_EVAL_MAX_ATTEMPTS="0")
+
+
+def test_eval_max_attempts_negative_raises():
+    with pytest.raises((ValueError, SystemExit)):
+        _make_config(SWE_EVAL_MAX_ATTEMPTS="-1")
+
+
+# ---------------------------------------------------------------------------
+# §4  Derived rollout guard formula
+# ---------------------------------------------------------------------------
+
+
+def test_derived_guard_uses_eval_max_attempts():
+    """guard = agent_budget + eval_timeout * eval_max_attempts + 180."""
+    cfg = _make_config(
+        SWE_AGENT_TIME_BUDGET_SEC="1800",
+        SWE_EVAL_TIMEOUT_SEC="600",
+        SWE_EVAL_MAX_ATTEMPTS="2",
+    )
+    assert cfg.rollout_guard_sec == 1800 + 600 * 2 + 180  # 3180
+
+
+def test_derived_guard_single_attempt():
+    """With max_attempts=1, guard = agent + eval*1 + 180."""
+    cfg = _make_config(
+        SWE_AGENT_TIME_BUDGET_SEC="1800",
+        SWE_EVAL_TIMEOUT_SEC="600",
+        SWE_EVAL_MAX_ATTEMPTS="1",
+    )
+    assert cfg.rollout_guard_sec == 1800 + 600 * 1 + 180  # 2580
+
+
+def test_explicit_guard_not_overridden():
+    """An explicit SWE_ROLLOUT_GUARD_SEC overrides the derived formula."""
+    with patch.dict(
+        os.environ,
+        {
+            "SWE_AGENT_TIME_BUDGET_SEC": "1800",
+            "SWE_EVAL_TIMEOUT_SEC": "600",
+            "SWE_EVAL_MAX_ATTEMPTS": "5",
+            "SWE_ROLLOUT_GUARD_SEC": "9999",
+            "ADAPTER_PUBLIC_HOST": "127.0.0.1",
+        },
+        clear=False,
+    ):
+        cfg = gen_mod.SweConfig.from_env()
+    assert cfg.rollout_guard_sec == 9999
