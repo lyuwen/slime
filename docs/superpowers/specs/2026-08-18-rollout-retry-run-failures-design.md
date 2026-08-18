@@ -31,20 +31,27 @@ Two components: **move launcher to user home** (primary fix, eliminates the `/tm
 **File:** `slime/agent/sandbox.py`  
 **Function:** `exec_and_wait`
 
-The launcher currently writes to `/tmp/.{tag}-{uuid}.sh`. Move it to the **user's home directory** (`~/tmp/.{tag}-{uuid}.sh`), which is guaranteed writable by that user once `ensure_agent_user` has run:
+The launcher and **all internally managed files** (`done_file`, `lock_dir`, default `out_file`) currently live in `/tmp/`. Move them to the **user's home directory** (`~/tmp/`), which is guaranteed writable by that user once `ensure_agent_user` has run:
 
 ```python
 home = "/root" if user == "root" else f"/home/{user}"
-launcher_dir = f"{home}/tmp"
-await sb.exec(f"mkdir -p {launcher_dir}", user=user, check=True, timeout=10)
-launcher = f"{launcher_dir}/.{slug}.sh"
+run_dir = f"{home}/tmp"
+await sb.exec(f"mkdir -p {run_dir}", user=user, check=True, timeout=10)
+
+out_file = out_file or f"{run_dir}/.{slug}.out"  # honor caller-provided path
+done_file = f"{run_dir}/.{slug}.done"
+launcher = f"{run_dir}/.{slug}.sh"
+lock_dir = f"{run_dir}/.{slug}.spawned"
 ```
+
+Moving only the launcher would be insufficient: if `/tmp` is temporarily unwritable by `agent`, `mkdir {lock_dir}` inside the launch command (`mkdir ... || exit 0`) would also fail silently, no process would start, and polling would wait the full time budget before returning -1 — no exception, so the retry never fires. Moving all four together eliminates `/tmp` dependence entirely for internally managed paths.
 
 ### Why This Fixes the Race
 
 - The failing write is `user="agent"` in `run_agent` (the harness run path), called **after** `ensure_agent_user` has created and chowned `/home/agent`. The agent's home is stable and writable the moment it's created — no readiness race.
 - Root launchers (npm install, swebench eval) move to `/root/tmp`, which root can always write.
 - `/tmp` was an arbitrary choice; user home is strictly safer and sidesteps the concurrency race entirely.
+- Moving all four internally managed paths together (`launcher`, `done_file`, `lock_dir`, default `out_file`) eliminates `/tmp` dependence. Caller-provided `out_file` paths are honored unchanged.
 
 ### Call-Site Invariants
 
@@ -93,7 +100,8 @@ for attempt in range(CONFIG.rollout_retries + 1):
         break
     except Exception as error:
         turns_recorded = state.adapter.manager.has_session(session_id)
-        if turns_recorded or attempt >= CONFIG.rollout_retries:
+        retryable = is_fresh_sandbox_retryable(error)
+        if turns_recorded or not retryable or attempt >= CONFIG.rollout_retries:
             raise
         if session_open:
             await state.adapter.drop_session(session_id, wait_timeout=30)
@@ -112,9 +120,15 @@ for attempt in range(CONFIG.rollout_retries + 1):
 
 ### Gate Logic
 
-`state.adapter.manager.has_session(session_id)` returns `True` iff at least one turn with real prompt messages was recorded. The tree is only created inside `record_turn` at `self._trees.setdefault(sid, MessageNode())` (`trajectory.py:300`), and `record_turn` early-returns on empty prompt before creating the tree (`trajectory.py:292-294`). So `has_session` exactly encodes the policy: **retry if no turns recorded (pre-launch failure); hard-fail once turns exist (partial trajectory).**
+The retry gate requires **both** conditions:
 
-This implements the "hard-fail after turns" policy from the clarifying questions. The mechanism supports retry-from-scratch if the policy changes later — just remove the `turns_recorded` check from the gate — but the current guard enforces hard-fail once turns exist.
+1. **No turns recorded** — `state.adapter.manager.has_session(session_id)` returns `True` iff at least one turn with real prompt messages was recorded. The tree is only created inside `record_turn` at `self._trees.setdefault(sid, MessageNode())` (`trajectory.py:300`), and `record_turn` early-returns on empty prompt before creating the tree (`trajectory.py:292-294`).
+
+2. **Retryable error** — `is_fresh_sandbox_retryable(error)` from `slime.agent.sandbox` is the existing kernel API for classifying errors that warrant a fresh-sandbox retry. It correctly recognizes generic `SandboxException` (unless containing `"does not exist"` or `"STOPPED state"`), E2B RPC transport errors, and sandbox setup failures. Reusing this avoids duplicating classification logic and prevents retrying deterministic errors (config mistakes, programming errors) that would never succeed.
+
+Combined: **retry if no turns recorded AND the error is fresh-sandbox retryable; hard-fail otherwise (turns exist, or deterministic error).**
+
+This implements the "hard-fail after turns" policy from the clarifying questions and preserves the existing transient-error classification. The mechanism supports retry-from-scratch if the policy changes later — just remove the `turns_recorded` check from the gate — but the current guard enforces hard-fail once turns exist.
 
 ### Per-Attempt Session ID
 
@@ -136,12 +150,18 @@ The sandbox is already correctly torn down. The exception propagates out of `asy
 
 Extend `examples/coding_agent_rl/test_retry.py` with unit tests using a fake adapter/manager (no real sandbox):
 
-1. **Pre-launch retry success** — `run()` raises on attempt 0 (before any turn), `has_session=False` → retry → succeeds on attempt 1. Only the winning sid's samples returned.
+1. **Pre-launch retry success** — `run()` raises a retryable error on attempt 0 (before any turn), `has_session=False` → retry → succeeds on attempt 1. Only the winning sid's samples returned.
 2. **Hard-fail after turns** — `run()` records a turn, then raises. `has_session=True` → immediate hard-fail, no retry.
-3. **Exhaust retries** — all attempts fail pre-launch → abort after `rollout_retries+1`, each failed sid dropped (store clean).
-4. **Fresh sid per attempt** — verify sids are `{base}-a0`, `{base}-a1`, ... and `base_sample.session_id` ends as the winning sid.
+3. **Hard-fail on non-retryable** — `run()` raises a non-retryable error (e.g. `ValueError`) before any turn. `has_session=False` but `is_fresh_sandbox_retryable=False` → immediate hard-fail, no retry.
+4. **Exhaust retries** — all attempts fail pre-launch (retryable) → abort after `rollout_retries+1`, each failed sid dropped (store clean).
+5. **Fresh sid per attempt** — verify sids are `{base}-a0`, `{base}-a1`, ... and `base_sample.session_id` ends as the winning sid.
 
-No new tests for the launcher-path change (Component 1) — it's a one-line path substitution with no new logic. Existing agent tests (`test_agent/`) exercise `exec_and_wait` and will catch breakage.
+For the launcher-path change (Component 1), add explicit assertions to `tests/test_agent/test_harness.py`:
+
+6. **Agent launcher path** — verify the launcher write goes to `/home/agent/tmp/.run-{uuid}.sh` when `user="agent"`, and that `done_file`, `lock_dir`, and default `out_file` also live in `/home/agent/tmp/`.
+7. **Root launcher path** — verify the launcher write goes to `/root/tmp/.{tag}-{uuid}.sh` when `user="root"`, and that all sibling paths also live in `/root/tmp/`.
+
+The existing tests check that *some* `run-*.sh` was written but don't assert location or user. These new assertions verify the home-directory path change is correct.
 
 ---
 
@@ -181,7 +201,7 @@ No new tests for the launcher-path change (Component 1) — it's a one-line path
 
 ## Summary
 
-- **Primary fix:** Move launcher from `/tmp` to user home (`~/tmp` for non-root, `/root/tmp` for root) in `exec_and_wait`. Sidesteps the `/tmp` readiness race under high-concurrency launches.
-- **Backstop:** Widen rollout retry to cover `run()`, gated on `has_session` (turns recorded). Fresh sid per attempt avoids `closed`-poisoning; only the winning sid reaches training.
-- **Testing:** Unit tests for retry logic (fake adapter); existing agent tests cover launcher path.
+- **Primary fix:** Move all internally managed `exec_and_wait` artifacts (`launcher`, `done_file`, `lock_dir`, default `out_file`) from `/tmp` to user home (`~/tmp` for non-root, `/root/tmp` for root). Sidesteps the `/tmp` readiness race under high-concurrency launches. Caller-provided `out_file` paths honored unchanged.
+- **Backstop:** Widen rollout retry to cover `run()`, gated on `has_session` (turns recorded) AND `is_fresh_sandbox_retryable` (error classification). Fresh sid per attempt avoids `closed`-poisoning; only the winning sid reaches training. Preserves existing transient-error classification to avoid retrying deterministic failures.
+- **Testing:** Unit tests for retry logic (fake adapter) including non-retryable hard-fail case; explicit path assertions for agent/root launcher locations in harness tests.
 - **Scope:** One minimal kernel change (`sandbox.py`), one example change (`generate.py`). No new abstractions, no upstream-sensitive refactors.
