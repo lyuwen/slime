@@ -99,10 +99,15 @@ for attempt in range(CONFIG.rollout_retries + 1):
         base_sample.session_id = session_id  # winning sid on success
         break
     except Exception as error:
+        if CONFIG.retry_policy == "always-fail":
+            raise
         turns_recorded = state.adapter.manager.has_session(session_id)
         retryable = is_fresh_sandbox_retryable(error)
-        if turns_recorded or not retryable or attempt >= CONFIG.rollout_retries:
+        if not retryable or attempt >= CONFIG.rollout_retries:
             raise
+        if CONFIG.retry_policy == "pre-launch" and turns_recorded:
+            raise
+        # retry permitted
         if session_open:
             await state.adapter.drop_session(session_id, wait_timeout=30)
             session_open = False
@@ -120,7 +125,9 @@ for attempt in range(CONFIG.rollout_retries + 1):
 
 ### Gate Logic
 
-The retry gate requires **both** conditions:
+The retry gate is controlled by `SWE_ROLLOUT_RETRY_POLICY` (env var, default `"pre-launch"`):
+
+**`"pre-launch"` (default, recommended)** — retry requires **both** conditions:
 
 1. **No turns recorded** — `state.adapter.manager.has_session(session_id)` returns `True` iff at least one turn with real prompt messages was recorded. The tree is only created inside `record_turn` at `self._trees.setdefault(sid, MessageNode())` (`trajectory.py:300`), and `record_turn` early-returns on empty prompt before creating the tree (`trajectory.py:292-294`).
 
@@ -128,7 +135,33 @@ The retry gate requires **both** conditions:
 
 Combined: **retry if no turns recorded AND the error is fresh-sandbox retryable; hard-fail otherwise (turns exist, or deterministic error).**
 
-This implements the "hard-fail after turns" policy from the clarifying questions and preserves the existing transient-error classification. The mechanism supports retry-from-scratch if the policy changes later — just remove the `turns_recorded` check from the gate — but the current guard enforces hard-fail once turns exist.
+**`"retry-from-scratch"` (experimental)** — retry on any retryable error regardless of turns. Drops the partial sid (discarding any already-generated turns and their token cost), opens a fresh sid, and retries from workspace prep. Use when mid-run instability (sandbox crashes, eval flakes) is more costly than wasted generation. Risks masking real issues by re-rolling.
+
+**`"always-fail"` (debug)** — never retry; hard-fail on any exception. Use to debug the retry logic itself or force immediate failure for CI.
+
+Parse at `SweConfig.from_env`:
+
+```python
+retry_policy = os.environ.get("SWE_ROLLOUT_RETRY_POLICY", "pre-launch")
+if retry_policy not in ("pre-launch", "retry-from-scratch", "always-fail"):
+    raise ValueError(f"SWE_ROLLOUT_RETRY_POLICY={retry_policy!r} invalid; must be pre-launch|retry-from-scratch|always-fail")
+```
+
+Gate implementation:
+
+```python
+if retry_policy == "always-fail":
+    raise
+turns_recorded = state.adapter.manager.has_session(session_id)
+retryable = is_fresh_sandbox_retryable(error)
+if not retryable or attempt >= CONFIG.rollout_retries:
+    raise
+if retry_policy == "pre-launch" and turns_recorded:
+    raise
+# retry permitted: drop session if open, backoff, continue
+```
+
+This makes the policy runtime-switchable without code changes, defaults to the safe "hard-fail after turns" behavior, and leaves the door open for experimenting with mid-run retry under controlled conditions.
 
 ### Per-Attempt Session ID
 
@@ -150,16 +183,19 @@ The sandbox is already correctly torn down. The exception propagates out of `asy
 
 Extend `examples/coding_agent_rl/test_retry.py` with unit tests using a fake adapter/manager (no real sandbox):
 
-1. **Pre-launch retry success** — `run()` raises a retryable error on attempt 0 (before any turn), `has_session=False` → retry → succeeds on attempt 1. Only the winning sid's samples returned.
-2. **Hard-fail after turns** — `run()` records a turn, then raises. `has_session=True` → immediate hard-fail, no retry.
+1. **Pre-launch retry success** — policy=`"pre-launch"`, `run()` raises a retryable error on attempt 0 (before any turn), `has_session=False` → retry → succeeds on attempt 1. Only the winning sid's samples returned.
+2. **Hard-fail after turns (pre-launch policy)** — policy=`"pre-launch"`, `run()` records a turn, then raises. `has_session=True` → immediate hard-fail, no retry.
 3. **Hard-fail on non-retryable** — `run()` raises a non-retryable error (e.g. `ValueError`) before any turn. `has_session=False` but `is_fresh_sandbox_retryable=False` → immediate hard-fail, no retry.
 4. **Exhaust retries** — all attempts fail pre-launch (retryable) → abort after `rollout_retries+1`, each failed sid dropped (store clean).
 5. **Fresh sid per attempt** — verify sids are `{base}-a0`, `{base}-a1`, ... and `base_sample.session_id` ends as the winning sid.
+6. **Retry-from-scratch policy** — policy=`"retry-from-scratch"`, `run()` records a turn, then raises retryable error → drops partial sid, retries with fresh sid. Verify the partial tree is discarded.
+7. **Always-fail policy** — policy=`"always-fail"`, any exception → immediate hard-fail, no retry, even if retryable and no turns.
+8. **Invalid policy** — `SWE_ROLLOUT_RETRY_POLICY="invalid"` → `ValueError` at `SweConfig.from_env`.
 
 For the launcher-path change (Component 1), add explicit assertions to `tests/test_agent/test_harness.py`:
 
-6. **Agent launcher path** — verify the launcher write goes to `/home/agent/tmp/.run-{uuid}.sh` when `user="agent"`, and that `done_file`, `lock_dir`, and default `out_file` also live in `/home/agent/tmp/`.
-7. **Root launcher path** — verify the launcher write goes to `/root/tmp/.{tag}-{uuid}.sh` when `user="root"`, and that all sibling paths also live in `/root/tmp/`.
+9. **Agent launcher path** — verify the launcher write goes to `/home/agent/tmp/.run-{uuid}.sh` when `user="agent"`, and that `done_file`, `lock_dir`, and default `out_file` also live in `/home/agent/tmp/`.
+10. **Root launcher path** — verify the launcher write goes to `/root/tmp/.{tag}-{uuid}.sh` when `user="root"`, and that all sibling paths also live in `/root/tmp/`.
 
 The existing tests check that *some* `run-*.sh` was written but don't assert location or user. These new assertions verify the home-directory path change is correct.
 
@@ -202,6 +238,6 @@ The existing tests check that *some* `run-*.sh` was written but don't assert loc
 ## Summary
 
 - **Primary fix:** Move all internally managed `exec_and_wait` artifacts (`launcher`, `done_file`, `lock_dir`, default `out_file`) from `/tmp` to user home (`~/tmp` for non-root, `/root/tmp` for root). Sidesteps the `/tmp` readiness race under high-concurrency launches. Caller-provided `out_file` paths honored unchanged.
-- **Backstop:** Widen rollout retry to cover `run()`, gated on `has_session` (turns recorded) AND `is_fresh_sandbox_retryable` (error classification). Fresh sid per attempt avoids `closed`-poisoning; only the winning sid reaches training. Preserves existing transient-error classification to avoid retrying deterministic failures.
-- **Testing:** Unit tests for retry logic (fake adapter) including non-retryable hard-fail case; explicit path assertions for agent/root launcher locations in harness tests.
-- **Scope:** One minimal kernel change (`sandbox.py`), one example change (`generate.py`). No new abstractions, no upstream-sensitive refactors.
+- **Backstop:** Widen rollout retry to cover `run()`, gated on policy (`SWE_ROLLOUT_RETRY_POLICY`, default `"pre-launch"`) + `is_fresh_sandbox_retryable` (error classification). Fresh sid per attempt avoids `closed`-poisoning; only the winning sid reaches training. Default policy hard-fails after turns; `"retry-from-scratch"` enables mid-run retry (experimental); `"always-fail"` disables retry (debug).
+- **Testing:** Unit tests for retry logic (fake adapter) covering all three policies + non-retryable hard-fail + invalid policy; explicit path assertions for agent/root launcher locations in harness tests.
+- **Scope:** One minimal kernel change (`sandbox.py`), one example change (`generate.py`) + config parsing. No new abstractions, no upstream-sensitive refactors.
