@@ -123,19 +123,25 @@ async def exec_and_wait(
     ``_await_done_marker``) -- none of which depend on a stream staying alive,
     and the polling doubles as an idle-GC keepalive while the command runs.
     """
-    # Per-call unique base for the launcher/marker/lock/out paths. A fixed
-    # /tmp/.{tag}.* collides across runs: if the path already exists owned by a
-    # different user (baked into the image, or left by a prior run in a recycled
-    # sandbox), the next user's write_file cannot reopen it and the gateway
-    # returns "open /tmp/.run.sh: permission denied". The uuid keeps tag in the
-    # name for debuggability while guaranteeing a fresh, unowned path each call.
+    # Derive user home directory
+    home = "/root" if user == "root" else f"/home/{user}"
+    run_dir = f"{home}/tmp"
+
+    # Per-call unique base for the launcher/marker/lock/out paths. Moving from
+    # /tmp to user home eliminates permission-denied errors under high concurrency:
+    # user home is stable and writable once ensure_agent_user runs. The uuid keeps
+    # tag in the name for debuggability while guaranteeing a fresh, unowned path.
     slug = f"{tag}-{uuid.uuid4().hex[:12]}"
-    out_file = out_file or f"/tmp/.{slug}.out"
-    done_file = f"/tmp/.{slug}.done"
-    launcher = f"/tmp/.{slug}.sh"
-    lock_dir = f"/tmp/.{slug}.spawned"
+    default_out_file = f"{run_dir}/.{slug}.out"
+    out_file = out_file or default_out_file
+    done_file = f"{run_dir}/.{slug}.done"
+    launcher = f"{run_dir}/.{slug}.sh"
+    lock_dir = f"{run_dir}/.{slug}.spawned"
     prefix = f"cd {workdir}\nexport HOME=/home/{user}\n" if workdir else ""
     launcher_body = f"#!/bin/bash\n{prefix}{cmd}\necho $? > {done_file}\n"
+
+    # Ensure run_dir exists before writing launcher
+    await sb.exec(f"mkdir -p {run_dir}", user=user, timeout=10, check=True)
     await sb.write_file(launcher, launcher_body, user=user)
 
     await sb.exec(
