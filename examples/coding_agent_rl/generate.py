@@ -351,7 +351,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     if reason:
         return _abort_result(base_sample, f"unevaluatable:{reason}", instance_id)
 
-    session_id = base_sample.session_id = _session_id(base_sample, instance_id)
+    base_session_id = _session_id(base_sample, instance_id)
+    session_id = base_session_id
     session_open = False
     t0 = time.time()
     traj_data = None
@@ -359,6 +360,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     try:
         async with asyncio.timeout(CONFIG.rollout_guard_sec):
             for attempt in range(CONFIG.rollout_retries + 1):
+                session_id = f"{base_session_id}-a{attempt}"
+                session_open = False
                 try:
                     async with boot_agent_sandbox(md["image"], instance_id) as sb:
                         await swe.prepare_workspace(sb, md["workdir"], md)
@@ -390,10 +393,21 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         diff_text = await swe.git_diff(sb, md["workdir"])
                         if AGENT_NAME == "openhands":
                             traj_data = await _read_sandbox_trajectory(sb, OpenHandsHarness.trajectory_sandbox_path)
+                    # Only the winning sid is used downstream (finish_session/eval).
+                    base_sample.session_id = session_id
                     break
                 except Exception as error:
-                    if session_open or attempt >= CONFIG.rollout_retries or not _is_retryable(error):
+                    if CONFIG.retry_policy == "always-fail":
                         raise
+                    turns_recorded = state.adapter.manager.has_session(session_id)
+                    if not _is_retryable(error) or attempt >= CONFIG.rollout_retries:
+                        raise
+                    if CONFIG.retry_policy == "pre-launch" and turns_recorded:
+                        raise
+                    # retry permitted
+                    if session_open:
+                        await state.adapter.drop_session(session_id, wait_timeout=30)
+                        session_open = False
                     backoff = 2**attempt
                     logger.warning(
                         "[coding_agent_rl] %s: setup attempt %d/%d failed: %s, retrying in %ds...",

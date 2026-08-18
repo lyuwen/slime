@@ -7,7 +7,7 @@ Run with: pytest examples/coding_agent_rl/test_retry.py
 
 import asyncio
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -138,6 +138,8 @@ def _make_state_mock():
     state.adapter.open_session = MagicMock()
     state.adapter.drop_session = AsyncMock()
     state.adapter.finish_session = AsyncMock(return_value=[MagicMock()])
+    # No turn recorded by default; retry gate treats failures before a turn as retryable.
+    state.adapter.manager.has_session = MagicMock(return_value=False)
     state.adapter_url = "http://test:18001"
     state.max_context_len = 131072
     state.tool_parser = "glm47"
@@ -321,6 +323,8 @@ async def test_failure_after_session_open_is_not_retried(base_patches):
     base_patches["mock_harness_inst"].run = AsyncMock(
         side_effect=RuntimeError("e2b exec failed (exit=255) after agent start")
     )
+    # A turn was recorded before the run() failure → pre-launch policy hard-fails.
+    base_patches["state"].adapter.manager.has_session = MagicMock(return_value=True)
 
     async def fast_sleep(_):
         pass
@@ -332,3 +336,124 @@ async def test_failure_after_session_open_is_not_retried(base_patches):
     assert base_patches["mock_harness_inst"].run.await_count == 1
     assert result == ["exception:RuntimeError"]
     base_patches["state"].adapter.drop_session.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Gate-logic tests — per-attempt session id + has_session/policy gating
+#
+# These exercise the EXACT gate ordering used inside generate()'s retry loop
+# with a self-contained FakeAdapter, rather than driving the real generate().
+# The local SandboxException stand-in (defined above) is classified retryable
+# by _is_retryable via the kernel classifier, matching e2b's real one by name.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FakeAdapter:
+    """Minimal fake adapter mirroring the pieces the retry gate touches:
+    a manager with has_session()/record_turn() and async drop_session()."""
+
+    class FakeManager:
+        def __init__(self):
+            self._sessions = set()
+
+        def has_session(self, sid: str) -> bool:
+            return sid in self._sessions
+
+        def record_turn(self, sid: str):
+            self._sessions.add(sid)
+
+    def __init__(self):
+        self.manager = self.FakeManager()
+        self._open_sessions = set()
+
+    def open_session(self, sid: str, **kwargs):
+        self._open_sessions.add(sid)
+
+    async def drop_session(self, sid: str, **kwargs):
+        self._open_sessions.discard(sid)
+
+
+@pytest.mark.anyio
+async def test_pre_launch_retry_success_kernel_error():
+    """Pre-launch policy: kernel-classified error with no turns → retry → success."""
+    adapter = FakeAdapter()
+    attempt_count = 0
+
+    async def fake_run():
+        nonlocal attempt_count
+        attempt_count += 1
+        if attempt_count == 1:
+            raise SandboxException("500: error creating file: permission denied")
+        return 0  # success on second attempt
+
+    config = replace(CONFIG, retry_policy="pre-launch", rollout_retries=3)
+
+    # Simulate the generate() retry loop's gate ordering.
+    base_sid = "test-session"
+    session_id = None
+    for attempt in range(config.rollout_retries + 1):
+        session_id = f"{base_sid}-a{attempt}"
+        session_open = False
+
+        try:
+            adapter.open_session(session_id)
+            session_open = True
+            exit_code = await fake_run()
+            assert exit_code == 0
+            break
+        except Exception as error:
+            if config.retry_policy == "always-fail":
+                raise
+            turns_recorded = adapter.manager.has_session(session_id)
+            if not _is_retryable(error) or attempt >= config.rollout_retries:
+                raise
+            if config.retry_policy == "pre-launch" and turns_recorded:
+                raise
+            if session_open:
+                await adapter.drop_session(session_id)
+                session_open = False
+            await asyncio.sleep(0.01)  # minimal sleep for test
+
+    assert attempt_count == 2, "Should retry once and succeed on attempt 2"
+    assert session_id == f"{base_sid}-a1", "Winning sid should be attempt 1"
+
+
+@pytest.mark.anyio
+async def test_hard_fail_after_turns():
+    """Pre-launch policy: error after turns recorded → immediate hard-fail, no retry."""
+    adapter = FakeAdapter()
+    attempt_count = 0
+
+    async def fake_run_with_turn():
+        nonlocal attempt_count
+        attempt_count += 1
+        adapter.manager.record_turn("test-session-a0")  # a turn lands, then we die
+        raise SandboxException("sandbox died mid-run")
+
+    config = replace(CONFIG, retry_policy="pre-launch", rollout_retries=3)
+
+    base_sid = "test-session"
+    raised = False
+
+    for attempt in range(config.rollout_retries + 1):
+        session_id = f"{base_sid}-a{attempt}"
+
+        try:
+            adapter.open_session(session_id)
+            await fake_run_with_turn()
+        except Exception as error:
+            if config.retry_policy == "always-fail":
+                raised = True
+                break
+            turns_recorded = adapter.manager.has_session(session_id)
+            if not _is_retryable(error) or attempt >= config.rollout_retries:
+                raised = True
+                break
+            if config.retry_policy == "pre-launch" and turns_recorded:
+                raised = True
+                break
+            pytest.fail("Should have hard-failed after turns")
+
+    assert raised, "Should have raised without retry"
+    assert attempt_count == 1, "Should only run once (no retry after turns)"
