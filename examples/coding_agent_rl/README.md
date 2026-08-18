@@ -148,7 +148,8 @@ contract (read inside `slime/agent/`); `SWE_*` are this SWE example's task knobs
 | `SLIME_AGENT_CC_EXTRA_ENVS` | unset | JSON object of extra env vars exported into the `claude` process — escape hatch for env-only knobs (`MAX_THINKING_TOKENS`, `BASH_MAX_TIMEOUT_MS`, ...). Merged last, so it can also override the built-in defaults. |
 | `SWE_AGENT_TIME_BUDGET_SEC` | `1800` | Wallclock budget for the in-sandbox agent CLI itself (think/edit/run). |
 | `SWE_EVAL_TIMEOUT_SEC` | `600` | Wallclock cap on the evaluator sandbox. |
-| `SWE_ROLLOUT_GUARD_SEC` | `agent+eval+180` | Outer safety net wrapping the whole rollout (boot + workspace + agent + diff + eval). Auto-derived if unset. |
+| `SWE_EVAL_MAX_ATTEMPTS` | `2` | Maximum number of fresh-sandbox evaluation attempts per rollout. Use `1` to disable retry and restore single-attempt behavior. A transient evaluator sandbox/transport failure triggers a fresh-sandbox retry up to this limit. |
+| `SWE_ROLLOUT_GUARD_SEC` | `agent+eval*attempts+180` | Outer safety net wrapping the whole rollout (boot + workspace + agent + diff + eval). Auto-derived as `SWE_AGENT_TIME_BUDGET_SEC + SWE_EVAL_TIMEOUT_SEC * SWE_EVAL_MAX_ATTEMPTS + 180` if unset; an explicit value is always authoritative. |
 | `SWE_BOOT_CONCURRENCY` | `16` | Cap on simultaneous sandbox boots (eases h2/SSL long-tail). |
 | `SWE_CC_PROMPT` | unset | Optional override for the user-turn prompt. Setting this to require sub-agent dispatch is the most reliable way to maximize fan-out. |
 | `SWE_TRAIN_PROTOCOL` / `SWE_EVAL_PROTOCOL` | `scaleswe` | Grading protocol for train / eval rollouts: `scaleswe`, `swebench`, or `auto`. `auto` picks per-sample from each row's own shape (a row with `swepro`/`eval_cmd`/`f2p_script` → scaleswe; else a row with `remote_env_info.test_patch` → swebench), so one dataset can interleave both formats. |
