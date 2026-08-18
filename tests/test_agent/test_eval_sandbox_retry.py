@@ -6,6 +6,8 @@ Covers:
   §3  SweConfig env-var parsing (generate.py)
   §4  Derived rollout guard formula
   §5  Log messages emitted during retry
+  §6  Grader execs are non-idempotent
+  §7  Real fresh-sandbox lifecycle (distinct sandboxes, cleanup, dispatch)
 """
 
 from __future__ import annotations
@@ -564,3 +566,139 @@ def test_f2p_grader_exec_is_non_idempotent():
     grading_execs = [(cmd, idem) for cmd, idem in ev.execs if "python" in cmd and "__cagent_f2p__" in cmd]
     assert grading_execs, "f2p grading command was never exec'd"
     assert all(idem is False for _cmd, idem in grading_execs), "f2p grader exec must be idempotent=False"
+
+
+# ---------------------------------------------------------------------------
+# §7  real fresh-sandbox lifecycle (drives run_evaluation -> _run_evaluation_once
+#      -> _grade_scaleswe; DOES NOT patch _run_evaluation_once)
+#
+# Every earlier retry test stubs _run_evaluation_once, so nothing exercised the
+# real grader path that constructs and tears down E2BSandbox instances. These
+# tests drive the real grader against a lifecycle-recording fake sandbox and
+# prove the spec's core guarantee: each retry boots a DISTINCT fresh evaluator
+# sandbox and BOTH are cleaned up (async-with __aexit__), with real protocol
+# dispatch in _run_evaluation_once for both scaleswe and swebench.
+# ---------------------------------------------------------------------------
+class _LifecycleSandbox:
+    """E2BSandbox stand-in that records construction + cleanup in a shared
+    registry so the test can assert distinct instances and async-with teardown.
+
+    The grading path exercised is the scaleswe ``eval_cmd`` one: empty
+    ``diff_text`` short-circuits ``_apply_diff`` to True (no patch tooling), so
+    the only execs are ``ensure_agent_user`` (id-agent probe) and the grading
+    command itself. ``ensure_agent_user`` only calls ``sb.exec``, which this
+    fake satisfies by returning ``(0, "", "")``.
+    """
+
+    def __init__(self, image, registry, *, fail_first_grading):
+        self.image = image
+        self.index = len(registry)  # 0 = attempt 1, 1 = attempt 2, ...
+        self.sandbox_id = f"sb-{self.index}"
+        self.entered = False
+        self.exited = False
+        self._fail_first_grading = fail_first_grading
+        self.exec_cmds = []
+        registry.append(self)
+
+    async def __aenter__(self):
+        self.entered = True
+        return self
+
+    async def __aexit__(self, *exc):
+        self.exited = True
+        return False
+
+    async def exec(self, cmd, *, user="root", env=None, timeout=120, check=False, idempotent=True):
+        self.exec_cmds.append(cmd)
+        # The FIRST sandbox fails the grading command to force a fresh-sandbox
+        # retry; the scanner's ensure_agent_user probe never matches "pytest -x".
+        if "pytest -x" in cmd and self.index == 0 and self._fail_first_grading:
+            raise _exc("ReadError", "stream broke mid-grade")
+        return (0, "", "")
+
+    async def write_file(self, path, content, *, user="root"):
+        return None
+
+    async def read_file(self, path, *, user="root"):
+        return ""
+
+
+def _scaleswe_md() -> dict:
+    """scaleswe metadata routing _grade_scaleswe down its eval_cmd path."""
+    return {
+        "protocol": "scaleswe",
+        "instance_id": "lc-1",
+        "image": "img",
+        "workdir": "/w",
+        "grading": {"eval_cmd": "pytest -x"},
+    }
+
+
+def _patch_lifecycle_sandbox(monkeypatch, fail_first_grading):
+    registry = []
+    monkeypatch.setattr(
+        swe_mod,
+        "E2BSandbox",
+        lambda image, **kw: _LifecycleSandbox(image, registry, fail_first_grading=fail_first_grading),
+    )
+    return registry
+
+
+def test_retry_creates_two_distinct_sandboxes_and_cleans_up_both(monkeypatch):
+    """Attempt 1 grades in a fresh sandbox whose grading exec fails retryably;
+    attempt 2 gets a DISTINCT second sandbox. Both must be cleaned up."""
+    registry = _patch_lifecycle_sandbox(monkeypatch, fail_first_grading=True)
+
+    async def run():
+        return await swe_mod.run_evaluation(_scaleswe_md(), diff_text="", timeout_sec=10, max_attempts=2)
+
+    result = asyncio.run(run())
+    assert result.reward == 1.0  # second attempt's eval_cmd exit 0 -> solved
+    assert len(registry) == 2  # two attempts -> two sandboxes
+    assert registry[0] is not registry[1]  # distinct instance objects
+    assert registry[0].sandbox_id != registry[1].sandbox_id
+    assert registry[0].entered and registry[1].entered  # both actually used
+    assert registry[0].exited and registry[1].exited  # both __aexit__-cleaned-up
+
+
+def test_single_attempt_creates_one_sandbox(monkeypatch):
+    """A clean first grade needs one sandbox and no retry."""
+    registry = _patch_lifecycle_sandbox(monkeypatch, fail_first_grading=False)
+
+    async def run():
+        return await swe_mod.run_evaluation(_scaleswe_md(), diff_text="", timeout_sec=10, max_attempts=2)
+
+    result = asyncio.run(run())
+    assert result.reward == 1.0
+    assert len(registry) == 1  # success on attempt 1 -> no retry
+    assert registry[0].entered
+    assert registry[0].exited
+
+
+def test_run_evaluation_once_dispatches_both_protocols(monkeypatch):
+    """The real _run_evaluation_once dispatch (only the leaf graders stubbed)
+    routes scaleswe -> _grade_scaleswe and swebench -> _grade_swebench. Stubbing
+    the graders (not the dispatcher) is the exact seam the review flagged."""
+    seen = {}
+
+    async def fake_scaleswe(md, diff_text, timeout_sec):
+        seen["scaleswe"] = seen.get("scaleswe", 0) + 1
+        return swe_mod.EvalResult(1.0, True)
+
+    async def fake_swebench(md, diff_text, timeout_sec):
+        seen["swebench"] = seen.get("swebench", 0) + 1
+        return swe_mod.EvalResult(1.0, True)
+
+    monkeypatch.setattr(swe_mod, "_grade_scaleswe", fake_scaleswe)
+    monkeypatch.setattr(swe_mod, "_grade_swebench", fake_swebench)
+
+    async def run():
+        await swe_mod.run_evaluation(
+            {"protocol": "scaleswe", "instance_id": "s1"}, diff_text="", timeout_sec=10, max_attempts=1
+        )
+        await swe_mod.run_evaluation(
+            {"protocol": "swebench", "instance_id": "s2"}, diff_text="", timeout_sec=10, max_attempts=1
+        )
+
+    asyncio.run(run())
+    assert seen == {"scaleswe": 1, "swebench": 1}
