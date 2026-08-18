@@ -479,6 +479,7 @@ def test_retry_warning_contains_instance_and_attempt(caplog):
     asyncio.run(run())
     warning_texts = [r.message for r in caplog.records if r.levelno == logging.WARNING]
     assert any("astropy_pr44" in t for t in warning_texts), "instance_id missing from warning"
+    assert any("scaleswe" in t for t in warning_texts), "protocol missing from warning"
     assert any("1/2" in t for t in warning_texts), "attempt count missing from warning"
     assert any("ReadError" in t for t in warning_texts), "exception type missing from warning"
     assert any("fresh evaluator sandbox" in t for t in warning_texts), "fresh sandbox note missing"
@@ -510,6 +511,7 @@ def test_success_after_retry_emits_info_log(caplog):
     asyncio.run(run())
     info_texts = [r.message for r in caplog.records if r.levelno == logging.INFO]
     assert any("inst-log" in t for t in info_texts), "instance_id missing from success info log"
+    assert any("scaleswe" in t for t in info_texts), "protocol missing from success info log"
     assert any("2" in t for t in info_texts), "attempt count missing from success info log"
 
 

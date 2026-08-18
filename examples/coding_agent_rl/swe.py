@@ -282,16 +282,22 @@ async def run_evaluation(
     trigger a retry. A returned ``EvalResult`` — including reward=0.0 or
     applied_cleanly=False — is never retried.
 
-    ``max_attempts=1`` preserves the original single-attempt behaviour.
+    ``max_attempts=1`` disables fresh-sandbox evaluation retry (a single
+    evaluation attempt). Note this is not identical to pre-retry behaviour:
+    grader commands are now issued non-idempotently, so they are no longer
+    transparently re-run in the same sandbox after an ambiguous stream break.
     """
+    instance_id = md.get("instance_id", "?")
+    protocol = md.get("protocol", "?")
     last_err: BaseException | None = None
     for attempt in range(1, max_attempts + 1):
         try:
             result = await _run_evaluation_once(md, diff_text, timeout_sec)
             if attempt > 1:
                 logger.info(
-                    "[swe] %s: eval succeeded on attempt %d/%d reward=%.2f",
-                    md.get("instance_id", "?"),
+                    "[swe] %s [%s]: eval succeeded on attempt %d/%d reward=%.2f",
+                    instance_id,
+                    protocol,
                     attempt,
                     max_attempts,
                     float(result.reward),
@@ -308,9 +314,10 @@ async def run_evaluation(
                 ceiling = min(8.0, 1.0 * (2 ** (attempt - 1)))
                 delay = random.uniform(0.0, ceiling)
                 logger.warning(
-                    "[swe] %s: eval attempt %d/%d failed (%s: %s); "
+                    "[swe] %s [%s]: eval attempt %d/%d failed (%s: %s); "
                     "backoff=%.1fs, next attempt uses a fresh evaluator sandbox",
-                    md.get("instance_id", "?"),
+                    instance_id,
+                    protocol,
                     attempt,
                     max_attempts,
                     type(e).__name__,
@@ -320,8 +327,9 @@ async def run_evaluation(
                 await asyncio.sleep(delay)
             else:
                 logger.warning(
-                    "[swe] %s: eval exhausted %d/%d attempts (%s: %s); re-raising",
-                    md.get("instance_id", "?"),
+                    "[swe] %s [%s]: eval exhausted %d/%d attempts (%s: %s); re-raising",
+                    instance_id,
+                    protocol,
                     attempt,
                     max_attempts,
                     type(e).__name__,
