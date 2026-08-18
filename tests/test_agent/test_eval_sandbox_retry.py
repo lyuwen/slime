@@ -13,6 +13,9 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -104,3 +107,210 @@ def test_same_sandbox_stopped_not_retried():
     sb = sandbox_mod.E2BSandbox.__new__(sandbox_mod.E2BSandbox)
     e = _exc("SandboxException", "sandbox in STOPPED state")
     assert not sb._is_transient_rpc_error(e)
+
+
+# ---------------------------------------------------------------------------
+# §2  run_evaluation() retry orchestration
+# ---------------------------------------------------------------------------
+
+import examples.coding_agent_rl.swe as swe_mod  # noqa: E402
+
+
+def _read_error() -> Exception:
+    return _exc("ReadError", "connection reset")
+
+
+def _make_eval_result(reward: float = 1.0) -> swe_mod.EvalResult:
+    return swe_mod.EvalResult(reward, True)
+
+
+def test_retry_on_read_error_succeeds_on_second_attempt():
+    """First attempt raises ReadError; second attempt succeeds.
+    The dispatcher must be called exactly twice and return the second result."""
+    second_result = _make_eval_result(1.0)
+    call_count = 0
+
+    async def fake_once(md, diff_text, timeout_sec):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise _read_error()
+        return second_result
+
+    async def run():
+        with patch.object(swe_mod, "_run_evaluation_once", fake_once):
+            return await swe_mod.run_evaluation(
+                {"protocol": "scaleswe", "instance_id": "inst-1"},
+                diff_text="diff",
+                timeout_sec=10,
+                max_attempts=2,
+            )
+
+    result = asyncio.run(run())
+    assert result == second_result
+    assert call_count == 2
+
+
+def test_no_retry_on_zero_reward():
+    """EvalResult(0.0, True) is a valid outcome and must NOT be retried."""
+    call_count = 0
+
+    async def fake_once(md, diff_text, timeout_sec):
+        nonlocal call_count
+        call_count += 1
+        return swe_mod.EvalResult(0.0, True)
+
+    async def run():
+        with patch.object(swe_mod, "_run_evaluation_once", fake_once):
+            return await swe_mod.run_evaluation(
+                {"protocol": "scaleswe", "instance_id": "inst-2"},
+                diff_text="",
+                timeout_sec=10,
+                max_attempts=3,
+            )
+
+    result = asyncio.run(run())
+    assert result == swe_mod.EvalResult(0.0, True)
+    assert call_count == 1
+
+
+def test_no_retry_on_apply_failure():
+    """EvalResult(0.0, False) (patch apply failure) must NOT be retried."""
+    call_count = 0
+
+    async def fake_once(md, diff_text, timeout_sec):
+        nonlocal call_count
+        call_count += 1
+        return swe_mod.EvalResult(0.0, False)
+
+    async def run():
+        with patch.object(swe_mod, "_run_evaluation_once", fake_once):
+            return await swe_mod.run_evaluation(
+                {"protocol": "scaleswe", "instance_id": "inst-3"},
+                diff_text="diff",
+                timeout_sec=10,
+                max_attempts=3,
+            )
+
+    result = asyncio.run(run())
+    assert result == swe_mod.EvalResult(0.0, False)
+    assert call_count == 1
+
+
+def test_exhausted_attempts_reraises_last_exception():
+    """When all max_attempts raise ReadError, the last exception is re-raised."""
+    call_count = 0
+
+    async def fake_once(md, diff_text, timeout_sec):
+        nonlocal call_count
+        call_count += 1
+        raise _read_error()
+
+    async def run():
+        with patch.object(swe_mod, "_run_evaluation_once", fake_once):
+            await swe_mod.run_evaluation(
+                {"protocol": "scaleswe", "instance_id": "inst-4"},
+                diff_text="diff",
+                timeout_sec=10,
+                max_attempts=3,
+            )
+
+    with pytest.raises(Exception, match="connection reset"):
+        asyncio.run(run())
+    assert call_count == 3
+
+
+def test_non_retryable_exception_propagates_immediately():
+    """A KeyError (non-infra) propagates after exactly one call."""
+    call_count = 0
+
+    async def fake_once(md, diff_text, timeout_sec):
+        nonlocal call_count
+        call_count += 1
+        raise KeyError("bad_key")
+
+    async def run():
+        with patch.object(swe_mod, "_run_evaluation_once", fake_once):
+            await swe_mod.run_evaluation(
+                {"protocol": "scaleswe", "instance_id": "inst-5"},
+                diff_text="diff",
+                timeout_sec=10,
+                max_attempts=3,
+            )
+
+    with pytest.raises(KeyError):
+        asyncio.run(run())
+    assert call_count == 1
+
+
+def test_cancelled_error_not_swallowed():
+    """asyncio.CancelledError must never be caught as a retry trigger."""
+    call_count = 0
+
+    async def fake_once(md, diff_text, timeout_sec):
+        nonlocal call_count
+        call_count += 1
+        raise asyncio.CancelledError()
+
+    async def run():
+        with patch.object(swe_mod, "_run_evaluation_once", fake_once):
+            await swe_mod.run_evaluation(
+                {"protocol": "scaleswe", "instance_id": "inst-6"},
+                diff_text="",
+                timeout_sec=10,
+                max_attempts=3,
+            )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(run())
+    assert call_count == 1
+
+
+def test_max_attempts_one_preserves_single_attempt_behavior():
+    """max_attempts=1 (old default) means one call, exception propagates."""
+    call_count = 0
+
+    async def fake_once(md, diff_text, timeout_sec):
+        nonlocal call_count
+        call_count += 1
+        raise _read_error()
+
+    async def run():
+        with patch.object(swe_mod, "_run_evaluation_once", fake_once):
+            await swe_mod.run_evaluation(
+                {"protocol": "scaleswe", "instance_id": "inst-7"},
+                diff_text="",
+                timeout_sec=10,
+                max_attempts=1,
+            )
+
+    with pytest.raises(Exception, match="connection reset"):
+        asyncio.run(run())
+    assert call_count == 1
+
+
+def test_scaleswe_and_swebench_both_use_retry_boundary():
+    """Both protocol values reach _run_evaluation_once under the retry loop."""
+    results = []
+
+    async def fake_once(md, diff_text, timeout_sec):
+        results.append(md["protocol"])
+        return swe_mod.EvalResult(1.0, True)
+
+    async def run():
+        with patch.object(swe_mod, "_run_evaluation_once", fake_once):
+            await swe_mod.run_evaluation(
+                {"protocol": "scaleswe", "instance_id": "s1"},
+                diff_text="",
+                timeout_sec=10,
+                max_attempts=1,
+            )
+            await swe_mod.run_evaluation(
+                {"protocol": "swebench", "instance_id": "s2"},
+                diff_text="",
+                timeout_sec=10,
+                max_attempts=1,
+            )
+
+    asyncio.run(run())
+    assert results == ["scaleswe", "swebench"]
