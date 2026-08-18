@@ -493,3 +493,152 @@ async def test_hard_fail_after_turns():
 
     assert raised, "Should have raised without retry"
     assert attempt_count == 1, "Should only run once (no retry after turns)"
+
+
+# ---------------------------------------------------------------------------
+# Remaining policy coverage — driven through the REAL generate() retry loop
+# via base_patches, so each row asserts against the shipped gate, not a copy.
+#
+# Failures are injected inside HARNESS_CLS().run (post-open_session) so a
+# per-attempt session is actually opened and can be observed being dropped.
+# has_session (turns_recorded) and CONFIG.retry_policy are varied per test.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_pre_launch_retry_success_example_classifier(base_patches):
+    """Pre-launch (default): example-classified RuntimeError inside run(), no
+    turns recorded → real generate() retries and the second attempt wins.
+
+    Distinct from test_generate_sets_winning_sid_with_attempt_suffix only in
+    intent: this asserts the *example* classifier branch of _is_retryable
+    ("e2b exec failed") drives a real retry, complementing the kernel-classifier
+    FakeAdapter unit test above.
+    """
+    from examples.coding_agent_rl.generate import generate
+
+    base_patches["mock_swe"].prepare_workspace = AsyncMock()
+    base_patches["mock_harness_inst"].run = AsyncMock(
+        side_effect=[RuntimeError("e2b exec failed (exit=255): mid-launch"), 0]
+    )
+
+    async def fast_sleep(_):
+        pass
+
+    sample = _make_sample_mock()
+    with patch("examples.coding_agent_rl.generate.asyncio.sleep", side_effect=fast_sleep):
+        result = await generate(MagicMock(), sample, {})
+
+    assert base_patches["mock_harness_inst"].run.await_count == 2
+    assert sample.session_id == "sess-123-a1"
+    assert result == base_patches["state"].adapter.finish_session.return_value
+
+
+@pytest.mark.anyio
+async def test_non_retryable_after_open_aborts_without_retry(base_patches):
+    """A non-retryable error raised inside run() (after open_session) aborts on
+    the first attempt: run() is invoked once and the opened sid is dropped."""
+    from examples.coding_agent_rl.generate import generate
+
+    base_patches["mock_swe"].prepare_workspace = AsyncMock()
+    base_patches["mock_harness_inst"].run = AsyncMock(side_effect=ValueError("not a sandbox problem"))
+
+    async def fast_sleep(_):
+        pass
+
+    with patch("examples.coding_agent_rl.generate.asyncio.sleep", side_effect=fast_sleep):
+        result = await generate(MagicMock(), _make_sample_mock(), {})
+
+    assert base_patches["mock_harness_inst"].run.await_count == 1
+    assert result == ["exception:ValueError"]
+    base_patches["state"].adapter.drop_session.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_exhaust_retries_drops_every_attempt_sid(base_patches):
+    """Every attempt fails retryably inside run() → abort after rollout_retries+1
+    attempts, with each per-attempt session opened and then dropped.
+
+    base_patches pins rollout_retries=2, so attempts a0/a1/a2 all run; each opens
+    a session and each is dropped (the last via the finally-block cleanup).
+    """
+    from examples.coding_agent_rl.generate import generate
+
+    base_patches["mock_swe"].prepare_workspace = AsyncMock()
+    base_patches["mock_harness_inst"].run = AsyncMock(
+        side_effect=RuntimeError("e2b exec failed (exit=255): persistent")
+    )
+
+    async def fast_sleep(_):
+        pass
+
+    with patch("examples.coding_agent_rl.generate.asyncio.sleep", side_effect=fast_sleep):
+        result = await generate(MagicMock(), _make_sample_mock(), {})
+
+    assert base_patches["mock_harness_inst"].run.await_count == 3  # a0, a1, a2
+    assert result == ["exception:RuntimeError"]
+
+    open_sids = [c.args[0] for c in base_patches["state"].adapter.open_session.call_args_list]
+    assert open_sids == ["sess-123-a0", "sess-123-a1", "sess-123-a2"]
+    drop_sids = [c.args[0] for c in base_patches["state"].adapter.drop_session.await_args_list]
+    # Every opened session is dropped (retry drops a0/a1, finally drops the last a2).
+    assert set(open_sids) <= set(drop_sids)
+
+
+@pytest.mark.anyio
+async def test_retry_from_scratch_retries_after_turns(base_patches):
+    """retry-from-scratch: a retryable error after a turn was recorded still
+    retries (unlike pre-launch), dropping the partial session, and a fresh sid wins.
+    """
+    from examples.coding_agent_rl import generate as gen_mod
+    from examples.coding_agent_rl.generate import generate
+
+    base_patches["mock_swe"].prepare_workspace = AsyncMock()
+    base_patches["mock_harness_inst"].run = AsyncMock(
+        side_effect=[RuntimeError("e2b exec failed (exit=255): died mid-turn"), 0]
+    )
+    # A turn WAS recorded on the failing attempt; pre-launch would hard-fail here,
+    # retry-from-scratch must retry anyway.
+    base_patches["state"].adapter.manager.has_session = MagicMock(return_value=True)
+
+    async def fast_sleep(_):
+        pass
+
+    sample = _make_sample_mock()
+    with (
+        patch.object(gen_mod, "CONFIG", replace(gen_mod.CONFIG, retry_policy="retry-from-scratch")),
+        patch("examples.coding_agent_rl.generate.asyncio.sleep", side_effect=fast_sleep),
+    ):
+        result = await generate(MagicMock(), sample, {})
+
+    assert base_patches["mock_harness_inst"].run.await_count == 2
+    assert sample.session_id == "sess-123-a1"
+    assert result == base_patches["state"].adapter.finish_session.return_value
+    # The partial (turns-recorded) first session was dropped before retrying.
+    drop_sids = [c.args[0] for c in base_patches["state"].adapter.drop_session.await_args_list]
+    assert "sess-123-a0" in drop_sids
+
+
+@pytest.mark.anyio
+async def test_always_fail_policy_aborts_on_first_retryable_error(base_patches):
+    """always-fail: even a retryable error inside run() aborts immediately with
+    no retry (run() invoked exactly once)."""
+    from examples.coding_agent_rl import generate as gen_mod
+    from examples.coding_agent_rl.generate import generate
+
+    base_patches["mock_swe"].prepare_workspace = AsyncMock()
+    base_patches["mock_harness_inst"].run = AsyncMock(
+        side_effect=RuntimeError("e2b exec failed (exit=255): retryable but policy=always-fail")
+    )
+
+    async def fast_sleep(_):
+        pass
+
+    with (
+        patch.object(gen_mod, "CONFIG", replace(gen_mod.CONFIG, retry_policy="always-fail")),
+        patch("examples.coding_agent_rl.generate.asyncio.sleep", side_effect=fast_sleep),
+    ):
+        result = await generate(MagicMock(), _make_sample_mock(), {})
+
+    assert base_patches["mock_harness_inst"].run.await_count == 1
+    assert result == ["exception:RuntimeError"]
