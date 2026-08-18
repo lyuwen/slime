@@ -210,14 +210,15 @@ The sandbox is already correctly torn down. The exception propagates out of `asy
 
 Extend `examples/coding_agent_rl/test_retry.py` with unit tests using a fake adapter/manager (no real sandbox):
 
-1. **Pre-launch retry success** — policy=`"pre-launch"`, `run()` raises a retryable error on attempt 0 (before any turn), `has_session=False` → retry → succeeds on attempt 1. Only the winning sid's samples returned.
-2. **Hard-fail after turns (pre-launch policy)** — policy=`"pre-launch"`, `run()` records a turn, then raises. `has_session=True` → immediate hard-fail, no retry.
-3. **Hard-fail on non-retryable** — `run()` raises a non-retryable error (e.g. `ValueError`) before any turn. `has_session=False` but `_is_retryable=False` → immediate hard-fail, no retry.
-4. **Exhaust retries** — all attempts fail pre-launch (retryable) → abort after `rollout_retries+1`, each failed sid dropped (store clean).
-5. **Fresh sid per attempt** — verify sids are `{base}-a0`, `{base}-a1`, ... and `base_sample.session_id` ends as the winning sid.
-6. **Retry-from-scratch policy** — policy=`"retry-from-scratch"`, `run()` records a turn, then raises retryable error → drops partial sid, retries with fresh sid. Verify the partial tree is discarded.
-7. **Always-fail policy** — policy=`"always-fail"`, any exception → immediate hard-fail, no retry, even if retryable and no turns.
-8. **Invalid policy** — `SWE_ROLLOUT_RETRY_POLICY="invalid"` → `ValueError` at `SweConfig.from_env`.
+1. **Pre-launch retry success (kernel-classified error)** — policy=`"pre-launch"`, `run()` raises `SandboxException("500: error creating file: ... permission denied")` on attempt 0 (before any turn), `has_session=False` → `_is_retryable=True` via kernel classifier → retry → succeeds on attempt 1. Only the winning sid's samples returned. This directly verifies the motivating failure.
+2. **Pre-launch retry success (example-classified error)** — policy=`"pre-launch"`, `run()` raises `RuntimeError("e2b exec failed exit=255")` on attempt 0 (before any turn), `has_session=False` → `_is_retryable=True` via example classifier → retry → succeeds on attempt 1. Verifies existing boot/workspace coverage is preserved.
+3. **Hard-fail after turns (pre-launch policy)** — policy=`"pre-launch"`, `run()` records a turn, then raises. `has_session=True` → immediate hard-fail, no retry.
+4. **Hard-fail on non-retryable** — `run()` raises a non-retryable error (e.g. `ValueError`) before any turn. `has_session=False` but `_is_retryable=False` → immediate hard-fail, no retry.
+5. **Exhaust retries** — all attempts fail pre-launch (retryable) → abort after `rollout_retries+1`, each failed sid dropped (store clean).
+6. **Fresh sid per attempt** — verify sids are `{base}-a0`, `{base}-a1`, ... and `base_sample.session_id` ends as the winning sid.
+7. **Retry-from-scratch policy** — policy=`"retry-from-scratch"`, `run()` records a turn, then raises retryable error → drops partial sid, retries with fresh sid. Verify the partial tree is discarded.
+8. **Always-fail policy** — policy=`"always-fail"`, any exception → immediate hard-fail, no retry, even if retryable and no turns.
+9. **Invalid policy** — `SWE_ROLLOUT_RETRY_POLICY="invalid"` → `ValueError` at `SweConfig.from_env`.
 
 For the launcher-path change (Component 1), add explicit assertions to `tests/test_agent/test_harness.py`:
 
@@ -255,7 +256,7 @@ The existing tests check that *some* `run-*.sh` was written but don't assert loc
 
 **Minimal kernel surface.** The launcher-path change is a one-line path substitution + one `mkdir`. The rollout retry is example-only.
 
-**Policy-agnostic mechanism.** Fresh sid per attempt means the mechanism supports all three partial-failure policies (hard-fail, retry-from-scratch, ship-partial) — just flip the gate. The current `has_session` guard implements hard-fail-after-turns, but the plumbing doesn't bake it in.
+**Policy-agnostic mechanism.** Fresh sid per attempt means the mechanism supports alternative retry policies — the current implementation provides hard-fail-after-turns (default), retry-from-scratch (experimental), and always-fail (debug). Adding ship-partial (finish and send partial trajectories) would just require calling `finish_session` on the partial sid before raising. The plumbing doesn't bake the policy in.
 
 **Fixes the diagnosed race without heuristics.** Moving to user home eliminates the `/tmp` readiness race entirely, no retry-budget tuning or probing needed. The rollout retry becomes a general backstop for *any* pre-launch failure, not just this one.
 
@@ -266,7 +267,7 @@ The existing tests check that *some* `run-*.sh` was written but don't assert loc
 ## Summary
 
 - **Primary fix:** Move all internally managed `exec_and_wait` artifacts (`launcher`, `done_file`, `lock_dir`, default `out_file`) from `/tmp` to user home (`~/tmp` for non-root, `/root/tmp` for root). Sidesteps the `/tmp` readiness race under high-concurrency launches. Caller-provided `out_file` paths honored unchanged.
-- **Backstop:** Widen rollout retry to cover `run()`, gated on policy (`SWE_ROLLOUT_RETRY_POLICY`, default `"pre-launch"`) + error classification (existing `_is_retryable` OR kernel `is_fresh_sandbox_retryable`). Fresh sid per attempt avoids `closed`-poisoning; only the winning sid reaches training. Default policy hard-fails after turns; `"retry-from-scratch"` enables mid-run retry (experimental); `"always-fail"` disables retry (debug).
+- **Backstop:** Widen rollout retry to cover `run()`, gated on policy (`SWE_ROLLOUT_RETRY_POLICY`, default `"pre-launch"`) + extended `_is_retryable` (combines example-specific and kernel classification). Fresh sid per attempt avoids `closed`-poisoning; only the winning sid reaches training. Default policy hard-fails after turns; `"retry-from-scratch"` enables mid-run retry (experimental); `"always-fail"` disables retry (debug).
 - **Testing:** Unit tests for retry logic (fake adapter) covering all three policies + non-retryable hard-fail + invalid policy; explicit path assertions for agent/root launcher locations in harness tests.
 - **Documentation:** Add `SWE_ROLLOUT_RETRY_POLICY` to `examples/coding_agent_rl/README.md` configuration table with policy descriptions.
 - **Scope:** One minimal kernel change (`sandbox.py`), one example change (`generate.py`) + config parsing, one README update. No new abstractions, no upstream-sensitive refactors.
