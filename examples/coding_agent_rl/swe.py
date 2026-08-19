@@ -310,9 +310,13 @@ async def run_evaluation(
                 raise  # deterministic error — propagate immediately
             last_err = e
             if attempt < max_attempts:
-                # bounded full-jitter exponential backoff
-                ceiling = min(8.0, 1.0 * (2 ** (attempt - 1)))
-                delay = random.uniform(0.0, ceiling)
+                # Half-jitter exponential backoff: floor grows with ceiling so
+                # every retry waits at least ceil/2 seconds, ensuring the delay
+                # increases meaningfully with each attempt rather than allowing
+                # near-zero draws on later attempts (full-jitter anti-pattern).
+                # Base 5 s gives: attempt 1 → [2.5, 5], 2 → [5, 10], 3 → [10, 20]
+                ceiling = min(30.0, 5.0 * (2 ** (attempt - 1)))
+                delay = random.uniform(ceiling / 2, ceiling)
                 logger.warning(
                     "[swe] %s [%s]: eval attempt %d/%d failed (%s: %s); "
                     "backoff=%.1fs, next attempt uses a fresh evaluator sandbox",

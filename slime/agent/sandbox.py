@@ -189,6 +189,7 @@ class E2BSandbox:
     rpc_retries_env = ("SLIME_AGENT_SANDBOX_RPC_RETRIES", "SWE_RPC_RETRIES")
     size_env = ("SLIME_AGENT_E2B_SANDBOX_SIZE", "SWE_E2B_SANDBOX_SIZE")
     template_env = ("SLIME_SANDBOX_TEMPLATE",)
+    job_id_env = ("SWE_JOB_ID", "RAY_JOB_ID")
 
     default_lifetime_sec = 3600
     default_rpc_retries = 6
@@ -219,6 +220,10 @@ class E2BSandbox:
     @classmethod
     def _image_metadata_key_from_env(cls) -> str | None:
         return _getenv(*cls.image_metadata_key_env) or None
+
+    @classmethod
+    def _job_id_from_env(cls) -> str:
+        return _getenv(*cls.job_id_env, default="unknown")
 
     @classmethod
     def _lifetime_sec_from_env(cls) -> int:
@@ -331,6 +336,7 @@ class E2BSandbox:
             "e2b.agents.kruise.io/wait-ready-timeout-seconds": "120",
             # Useful identifiers
             "label:swe-instance-id": self.image.rsplit("/", 1)[-1].replace(":", "___"),
+            "label:swe-job-id": self._job_id_from_env(),
             # During debugging only
             "e2b.agents.kruise.io/reserve-failed-sandbox-for": "10m",
         }
