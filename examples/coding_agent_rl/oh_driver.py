@@ -183,11 +183,14 @@ def _warn_trajectory(message: str) -> None:
         pass
 
 
-def write_trajectory(path: str, events, initial_tools=None) -> None:
+def write_trajectory(path: str, events, initial_tools=None, metrics=None) -> None:
     """Best-effort atomic dump of the converted trajectory to ``path``.
 
-    Writes an object ``{"messages": [...], "tools": [...]}`` so the host-side
-    reader can access both the message history and the tool schema in one file.
+    Writes an object ``{"messages": [...], "tools": [...], "metrics": {...}}``
+    so the host-side reader can access the message history, tool schema, and
+    token-usage counters in one file.  ``metrics`` is a ``Metrics`` instance
+    from ``conv.conversation_stats.get_combined_metrics()``; when absent the
+    key is omitted for backwards compatibility.
 
     Runs inside the sandbox as user ``agent``; any failure is swallowed so a
     trace problem never aborts an otherwise-complete run.
@@ -196,6 +199,8 @@ def write_trajectory(path: str, events, initial_tools=None) -> None:
         messages = events_to_trajectory(events)
         tools = tools_to_trajectory(events, initial_tools or [])
         payload = {"messages": messages, "tools": tools}
+        if metrics is not None:
+            payload["metrics"] = metrics.get()
         directory = os.path.dirname(path) or "."
         fd, tmp = tempfile.mkstemp(dir=directory, prefix=".oh_traj_", suffix=".tmp")
         try:
@@ -256,7 +261,9 @@ def main(config_path: str) -> int:
         conv.run()
     trajectory_path = cfg.get("trajectory_path")
     if trajectory_path:
-        write_trajectory(trajectory_path, conv.state.events, agent.tools)
+        write_trajectory(
+            trajectory_path, conv.state.events, agent.tools, metrics=conv.conversation_stats.get_combined_metrics()
+        )
     return 0
 
 

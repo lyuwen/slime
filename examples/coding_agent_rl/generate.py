@@ -441,6 +441,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     base_sample,
                     messages=traj_data["messages"],
                     tools=traj_data["tools"],
+                    metrics=traj_data.get("metrics"),
                     diff_text=diff_text,
                     reward=float(reward),
                     applied_cleanly=bool(applied_cleanly),
@@ -608,6 +609,7 @@ def _persist_trajectory(
     instance_id: str,
     session_id: str,
     agent_exit_code: int | None,
+    metrics: dict | None = None,
 ) -> None:
     """Best-effort atomic write of the enriched trajectory document."""
     try:
@@ -626,6 +628,8 @@ def _persist_trajectory(
             "session_id": session_id,
             "agent_exit_code": agent_exit_code,
         }
+        if metrics is not None:
+            doc["metrics"] = metrics
         fd, tmp = tempfile.mkstemp(dir=directory, prefix=".traj_", suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as file:
