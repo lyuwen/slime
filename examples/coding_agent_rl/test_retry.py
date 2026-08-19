@@ -746,3 +746,119 @@ async def test_always_fail_policy_aborts_provisioning_without_boot_retries():
     assert fake_e2b_cls.call_count == 1
     assert fake_sb.__aenter__.await_count == 1
     assert result == ["exception:SandboxException"]
+
+
+# ---------------------------------------------------------------------------
+# Budget gate — retries are refused when too little agent budget remains.
+#
+# Driven through the REAL generate() retry loop. boot_agent_sandbox is NOT
+# patched, so boot_retries is pinned to 1 to make fake_e2b_cls.call_count track
+# the *outer* retry attempts (one E2BSandbox construction per outer attempt).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_budget_gate_blocks_retry_when_budget_low(monkeypatch):
+    from examples.coding_agent_rl import generate as gen_mod
+    from examples.coding_agent_rl.generate import generate
+
+    # Fresh sandbox that always raises a retryable error on enter.
+    fake_sb = AsyncMock()
+    fake_sb.__aenter__ = AsyncMock(side_effect=RuntimeError("e2b connection lost"))
+    fake_sb.__aexit__ = AsyncMock(return_value=False)
+    fake_e2b_cls = MagicMock(return_value=fake_sb)
+
+    state = _make_state_mock()
+    mock_harness_cls = MagicMock(return_value=AsyncMock())
+    mock_swe = MagicMock()
+    mock_swe.get_metadata.return_value = _make_sample_mock().metadata["swe_metadata"]
+    mock_swe.evaluability_check.return_value = None
+    mock_swe.prepare_workspace = AsyncMock()
+
+    async def fast_sleep(_):
+        pass
+
+    # Clock: first call = t0, second call (in gate) = t0 + 1000s elapsed.
+    # agent_time_budget_sec=1800, floor=900 -> remaining=800 < 900 -> no retry.
+    times = iter([1000.0, 2000.0, 2000.0, 2000.0])
+    monkeypatch.setattr(gen_mod.time, "time", lambda: next(times, 2000.0))
+
+    with (
+        patch("examples.coding_agent_rl.generate._AdapterService", return_value=state),
+        patch("examples.coding_agent_rl.generate.E2BSandbox", fake_e2b_cls),
+        patch("examples.coding_agent_rl.generate.HARNESS_CLS", mock_harness_cls),
+        patch("examples.coding_agent_rl.generate.swe", mock_swe),
+        patch("examples.coding_agent_rl.generate._session_id", return_value="sess-123"),
+        patch("examples.coding_agent_rl.generate.get_prompt", return_value="prompt"),
+        patch("examples.coding_agent_rl.generate._abort_result", side_effect=lambda s, r, i: [r]),
+        patch.object(
+            gen_mod,
+            "CONFIG",
+            replace(
+                gen_mod.CONFIG,
+                retry_policy="retry-from-scratch",
+                boot_retries=1,
+                rollout_retries=2,
+                agent_time_budget_sec=1800,
+                retry_min_budget_sec=900,
+            ),
+        ),
+        patch("examples.coding_agent_rl.generate.asyncio.sleep", side_effect=fast_sleep),
+    ):
+        result = await generate(MagicMock(), _make_sample_mock(), {})
+
+    # Budget gate fired: provisioning attempted exactly once, no retry.
+    assert fake_e2b_cls.call_count == 1
+    assert result == ["exception:RuntimeError"]
+
+
+@pytest.mark.anyio
+async def test_budget_gate_allows_retry_when_budget_ample(monkeypatch):
+    from examples.coding_agent_rl import generate as gen_mod
+    from examples.coding_agent_rl.generate import generate
+
+    fake_sb = AsyncMock()
+    fake_sb.__aenter__ = AsyncMock(side_effect=RuntimeError("e2b connection lost"))
+    fake_sb.__aexit__ = AsyncMock(return_value=False)
+    fake_e2b_cls = MagicMock(return_value=fake_sb)
+
+    state = _make_state_mock()
+    mock_harness_cls = MagicMock(return_value=AsyncMock())
+    mock_swe = MagicMock()
+    mock_swe.get_metadata.return_value = _make_sample_mock().metadata["swe_metadata"]
+    mock_swe.evaluability_check.return_value = None
+    mock_swe.prepare_workspace = AsyncMock()
+
+    async def fast_sleep(_):
+        pass
+
+    # Clock always near t0 -> remaining ~= full budget, well above floor.
+    monkeypatch.setattr(gen_mod.time, "time", lambda: 1000.0)
+
+    with (
+        patch("examples.coding_agent_rl.generate._AdapterService", return_value=state),
+        patch("examples.coding_agent_rl.generate.E2BSandbox", fake_e2b_cls),
+        patch("examples.coding_agent_rl.generate.HARNESS_CLS", mock_harness_cls),
+        patch("examples.coding_agent_rl.generate.swe", mock_swe),
+        patch("examples.coding_agent_rl.generate._session_id", return_value="sess-123"),
+        patch("examples.coding_agent_rl.generate.get_prompt", return_value="prompt"),
+        patch("examples.coding_agent_rl.generate._abort_result", side_effect=lambda s, r, i: [r]),
+        patch.object(
+            gen_mod,
+            "CONFIG",
+            replace(
+                gen_mod.CONFIG,
+                retry_policy="retry-from-scratch",
+                boot_retries=1,
+                rollout_retries=2,
+                agent_time_budget_sec=1800,
+                retry_min_budget_sec=900,
+            ),
+        ),
+        patch("examples.coding_agent_rl.generate.asyncio.sleep", side_effect=fast_sleep),
+    ):
+        result = await generate(MagicMock(), _make_sample_mock(), {})
+
+    # All attempts consumed: initial + 2 retries = 3 provisioning attempts.
+    assert fake_e2b_cls.call_count == 3
+    assert result == ["exception:RuntimeError"]

@@ -418,6 +418,16 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     turns_recorded = state.adapter.manager.has_session(session_id)
                     if not _is_retryable(error) or attempt >= CONFIG.rollout_retries:
                         raise
+                    remaining = CONFIG.agent_time_budget_sec - (time.time() - t0)
+                    if remaining < CONFIG.retry_min_budget_sec:
+                        logger.warning(
+                            "[coding_agent_rl] %s: %.0fs agent budget remaining < "
+                            "retry_min_budget %.0fs; not retrying",
+                            instance_id,
+                            remaining,
+                            CONFIG.retry_min_budget_sec,
+                        )
+                        raise
                     if CONFIG.retry_policy == "pre-launch" and turns_recorded:
                         raise
                     # retry permitted
