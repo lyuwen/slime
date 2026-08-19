@@ -194,6 +194,7 @@ class Sample:
     class PrefixCacheInfo:
         cached_tokens: int = 0
         total_prompt_tokens: int = 0
+        completion_tokens: int = 0
 
         @property
         def prefix_cache_hit_rate(self) -> float:
@@ -203,11 +204,13 @@ class Sample:
             self.cached_tokens += meta_info.get("cached_tokens", 0)
             # new_tokens = input_tokens - cached_tokens
             self.total_prompt_tokens += meta_info.get("prompt_tokens", 0)
+            self.completion_tokens += meta_info.get("completion_tokens", 0)
 
         def to_dict(self):
             return {
                 "cached_tokens": self.cached_tokens,
                 "total_prompt_tokens": self.total_prompt_tokens,
+                "completion_tokens": self.completion_tokens,
             }
 
         @staticmethod
@@ -215,6 +218,7 @@ class Sample:
             info = Sample.PrefixCacheInfo()
             info.cached_tokens = data.get("cached_tokens", 0)
             info.total_prompt_tokens = data.get("total_prompt_tokens", 0)
+            info.completion_tokens = data.get("completion_tokens", 0)
             return info
 
     prefix_cache_info: PrefixCacheInfo = field(default_factory=PrefixCacheInfo)
