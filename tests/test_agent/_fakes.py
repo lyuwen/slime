@@ -292,7 +292,7 @@ class FakeSandbox:
     async def write_file(self, sandbox_path, content, *, user="root") -> None:
         self.files[sandbox_path] = content
 
-    async def read_file(self, sandbox_path, *, user="root") -> str:
+    async def read_file(self, sandbox_path, *, user="root", strict=False) -> str:
         return _as_str(self.files.get(sandbox_path, ""))
 
 

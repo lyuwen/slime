@@ -432,7 +432,7 @@ async def _run_swepro(ev: Sandbox, workdir: str, swepro: dict, timeout: int) -> 
         check=False,
         timeout=120,
     )
-    raw = await ev.read_file(result_f, user="agent")
+    raw = await ev.read_file(result_f, user="agent", strict=True)
     parsed = json.loads(raw) if raw else {"tests": []}
     passed = {t["name"] for t in parsed.get("tests", []) if t.get("status") == "PASSED"}
     required = set(swepro.get("fail_to_pass") or []) | set(swepro.get("pass_to_pass") or [])
@@ -577,7 +577,13 @@ async def _grade_swebench(md: dict, diff_text: str, timeout_sec: int) -> EvalRes
             logger.warning("[swe.swebench] %s: model patch failed to apply; reward=0", instance_id)
             return EvalResult(0.0, False)
         exit_code, log = await exec_and_wait(
-            ev, cmd="bash /tmp/eval.sh", user="root", time_budget_sec=timeout_sec, tag="eval", want_output=True
+            ev,
+            cmd="bash /tmp/eval.sh",
+            user="root",
+            time_budget_sec=timeout_sec,
+            tag="eval",
+            want_output=True,
+            strict_output=True,
         )
 
     try:

@@ -75,7 +75,7 @@ class Sandbox(Protocol):
 
     async def write_file(self, sandbox_path: str, content: FileContent, *, user: str = "root") -> None: ...
 
-    async def read_file(self, sandbox_path: str, *, user: str = "root") -> str: ...
+    async def read_file(self, sandbox_path: str, *, user: str = "root", strict: bool = False) -> str: ...
 
 
 EXIT_TIME_BUDGET_EXCEEDED = -1
@@ -109,8 +109,13 @@ async def exec_and_wait(
     workdir: str | None = None,
     out_file: str | None = None,
     want_output: bool = False,
+    strict_output: bool = False,
 ) -> tuple[int, str]:
     """Run ``cmd`` to completion detached, returning ``(exit_code, output)``.
+
+    ``strict_output=True`` applies ``read_file(strict=True)`` when
+    ``want_output=True`` so a fresh-retryable output-read failure propagates to
+    the caller's retry boundary instead of being returned as an empty log.
 
     A plain ``sb.exec`` keeps an HTTP/2 stream open for the command's whole
     runtime, so a long-running command (build, test suite) outlives what the
@@ -159,7 +164,7 @@ async def exec_and_wait(
     if exit_code == 0 and not want_output:
         return exit_code, ""
     if want_output:
-        return exit_code, await sb.read_file(out_file, user=user)
+        return exit_code, await sb.read_file(out_file, user=user, strict=strict_output)
     _, tail, _ = await sb.exec(f"tail -c 512 {out_file} 2>/dev/null", user=user, timeout=15, check=False)
     return exit_code, tail or ""
 
@@ -422,13 +427,25 @@ class E2BSandbox:
             lambda: self._sb.files.write(sandbox_path, content, user=user),
         )
 
-    async def read_file(self, sandbox_path: str, *, user: str = "root") -> str:
+    async def read_file(self, sandbox_path: str, *, user: str = "root", strict: bool = False) -> str:
+        """Read a sandbox file, returning its contents (``""`` on failure).
+
+        :param strict: When True, an infrastructure failure that a fresh
+            sandbox could recover (``is_fresh_sandbox_retryable``) is re-raised
+            instead of masked as ``""``, letting a retry boundary recreate the
+            sandbox rather than mistaking a transient read for a missing file.
+            Non-recoverable errors (and a genuinely absent file) still yield
+            ``""``. Default False preserves the always-returns-a-string contract
+            relied on by the rollout/harness read paths.
+        """
         try:
             return await self._rpc_retry(
                 f"read_file({sandbox_path})",
                 lambda: self._sb.files.read(sandbox_path, user=user),
             )
-        except Exception:
+        except Exception as e:
+            if strict and is_fresh_sandbox_retryable(e):
+                raise
             return ""
 
 

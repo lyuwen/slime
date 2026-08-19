@@ -8,6 +8,8 @@ Covers:
   §5  Log messages emitted during retry
   §6  Grader execs are non-idempotent
   §7  Real fresh-sandbox lifecycle (distinct sandboxes, cleanup, dispatch)
+  §8  read_file(strict=) contract (fresh-retryable re-raise vs "" masking)
+  §9  SWE-bench strict-output integration (real exec_and_wait + real grader)
 """
 
 from __future__ import annotations
@@ -540,7 +542,7 @@ class _RecordingSandbox:
     async def write_file(self, path, content, *, user="root"):
         return None
 
-    async def read_file(self, path, *, user="root"):
+    async def read_file(self, path, *, user="root", strict=False):
         return ""
 
 
@@ -622,7 +624,7 @@ class _LifecycleSandbox:
     async def write_file(self, path, content, *, user="root"):
         return None
 
-    async def read_file(self, path, *, user="root"):
+    async def read_file(self, path, *, user="root", strict=False):
         return ""
 
 
@@ -705,3 +707,282 @@ def test_run_evaluation_once_dispatches_both_protocols(monkeypatch):
 
     asyncio.run(run())
     assert seen == {"scaleswe": 1, "swebench": 1}
+
+
+# ---------------------------------------------------------------------------
+# §8  read_file(strict=) contract
+#
+# The evaluator grader reads its result file with strict=True so a transient
+# infra read failure re-raises (reaching run_evaluation's fresh-sandbox retry
+# boundary) instead of being masked as "" -> {"tests": []} -> a false reward=0.
+# The rollout/harness read paths keep strict=False (always-returns-a-string).
+# These tests isolate read_file by stubbing _rpc_retry with the raising factory.
+# ---------------------------------------------------------------------------
+
+
+def _bare_sandbox() -> sandbox_mod.E2BSandbox:
+    """An E2BSandbox instance without running __init__ (mirrors line ~122)."""
+    return sandbox_mod.E2BSandbox.__new__(sandbox_mod.E2BSandbox)
+
+
+def _read_with_rpc_raising(exc: BaseException, *, strict: bool) -> str:
+    sb = _bare_sandbox()
+
+    async def boom(_op, _factory):
+        raise exc
+
+    async def run():
+        with patch.object(sb, "_rpc_retry", boom):
+            return await sb.read_file("/tmp/result.json", user="agent", strict=strict)
+
+    return asyncio.run(run())
+
+
+def test_read_file_strict_reraises_fresh_retryable():
+    """strict=True re-raises a fresh-retryable infra error (ReadError) so the
+    retry boundary can recreate the sandbox."""
+    with pytest.raises(Exception, match="connection reset"):
+        _read_with_rpc_raising(_exc("ReadError", "connection reset"), strict=True)
+
+
+def test_read_file_strict_reraises_generic_sandbox_exception():
+    """A generic (transient gateway) SandboxException is fresh-retryable and so
+    also re-raises under strict=True."""
+    with pytest.raises(Exception, match="gateway timeout"):
+        _read_with_rpc_raising(_exc("SandboxException", "gateway timeout"), strict=True)
+
+
+def test_read_file_strict_swallows_permanent_sandbox_exception():
+    """A permanent-marker SandboxException is NOT fresh-retryable; even under
+    strict=True it degrades to "" rather than raising (a fresh sandbox cannot
+    recover it, so retrying is pointless)."""
+    assert _read_with_rpc_raising(_exc("SandboxException", "quota exceeded"), strict=True) == ""
+
+
+def test_read_file_strict_swallows_missing_file_sandbox_exception():
+    """'does not exist' means the file is genuinely absent on THIS sandbox --
+    but is_fresh_sandbox_retryable treats a stopped/missing *sandbox* as
+    retryable, so a fresh sandbox is booted. This documents that a missing file
+    surfaced as a stopped/missing-sandbox SandboxException re-raises; a plain
+    absent file (no infra exception -> empty read) still yields ""."""
+    with pytest.raises(Exception, match="does not exist"):
+        _read_with_rpc_raising(_exc("SandboxException", "sandbox does not exist"), strict=True)
+
+
+def test_read_file_non_strict_never_raises():
+    """Default strict=False preserves the always-returns-a-string contract for
+    the rollout/harness read paths -- even a fresh-retryable infra error yields
+    "" so those callers are unaffected by the evaluator opt-in."""
+    assert _read_with_rpc_raising(_exc("ReadError", "connection reset"), strict=False) == ""
+    assert _read_with_rpc_raising(_exc("SandboxException", "gateway timeout"), strict=False) == ""
+
+
+def test_read_file_non_retryable_swallowed_under_strict():
+    """A non-infra error (KeyError) is not fresh-retryable; strict=True still
+    degrades it to "" (only fresh-retryable errors re-raise)."""
+    assert _read_with_rpc_raising(KeyError("boom"), strict=True) == ""
+
+
+# ---------------------------------------------------------------------------
+# §9  SWE-bench strict-output integration (real exec_and_wait + real grader)
+#
+# The prior test gap the review flagged: every swebench retry test either
+# stubbed _run_evaluation_once (skipping the real grader) or asserted the
+# strict flag only on read_file in isolation. Nothing proved that
+# _grade_swebench passes strict_output=True INTO the real exec_and_wait, that
+# exec_and_wait forwards it as read_file(strict=True), and that a fresh-
+# retryable OUTPUT read failure there propagates out of _grade_swebench ->
+# _run_evaluation_once -> run_evaluation to boot a second fresh sandbox instead
+# of returning a false reward=0 from an empty log.
+#
+# These tests drive the REAL call chain:
+#   run_evaluation -> _run_evaluation_once -> _grade_swebench
+#     -> real sandbox.exec_and_wait(..., strict_output=True)
+#       -> fake sb.read_file(strict=True)
+# exec_and_wait is NOT mocked; only the swebench-package leaves
+# (_build_test_spec / _eval_report_from_log / _apply_model_patch) and the
+# E2BSandbox class are stubbed so the test runs on the CPU env without swebench.
+# ---------------------------------------------------------------------------
+
+# Recover the marker path from exec_and_wait's setsid launcher and match its
+# ``test -f X && cat X`` poll -- mirrors tests/test_agent/_fakes.py helpers so
+# the real exec_and_wait handshake resolves against this fake.
+import re  # noqa: E402
+
+_POLL_RE = re.compile(r"test -f (\S+) && cat ")
+
+
+def _done_path_from_launch(cmd: str) -> str | None:
+    m = re.search(r"setsid bash (\S+)\.sh\b", cmd)
+    return f"{m.group(1)}.done" if m else None
+
+
+class _SwebenchLifecycleSandbox:
+    """E2BSandbox stand-in that drives the REAL exec_and_wait detached-launch /
+    poll-marker handshake and records the ``strict`` flag every ``read_file``
+    receives, plus construction + cleanup, in a shared registry.
+
+    The first sandbox (index 0) raises a fresh-retryable ``ReadError`` from the
+    eval-output ``read_file`` *only when* ``strict=True`` -- so the test both
+    proves strict propagation and forces exactly one fresh-sandbox retry. The
+    second sandbox returns the captured eval log so grading proceeds.
+    """
+
+    def __init__(self, image, registry, *, out_payload, fail_first_strict_read):
+        self.image = image
+        self.index = len(registry)
+        self.sandbox_id = f"sweb-sb-{self.index}"
+        self.entered = False
+        self.exited = False
+        self._out_payload = out_payload
+        self._fail_first_strict_read = fail_first_strict_read
+        self.files: dict[str, str] = {}
+        self.exec_cmds: list[str] = []
+        self.read_strict_flags: list[tuple[str, bool]] = []  # (path, strict)
+        registry.append(self)
+
+    async def __aenter__(self):
+        self.entered = True
+        return self
+
+    async def __aexit__(self, *exc):
+        self.exited = True
+        return False
+
+    async def exec(self, cmd, *, user="root", env=None, timeout=120, check=False, idempotent=True):
+        self.exec_cmds.append(cmd)
+        # Detached launch: exec_and_wait fires the command fully detached, then
+        # polls a done-marker. Drop the marker so the very next poll returns 0.
+        if "setsid bash" in cmd:
+            done = _done_path_from_launch(cmd)
+            if done:
+                self.files[done] = "0\n"
+            return (0, "", "")
+        # Marker poll: ``test -f {done} && cat {done}``.
+        m = _POLL_RE.search(cmd)
+        if m:
+            path = m.group(1)
+            if path in self.files:
+                return (0, self.files[path], "")
+            return (1, "", "")
+        return (0, "", "")
+
+    async def write_file(self, path, content, *, user="root"):
+        self.files[path] = content
+
+    async def read_file(self, path, *, user="root", strict=False):
+        # Record what strict value exec_and_wait forwarded for the output read.
+        self.read_strict_flags.append((path, strict))
+        if self.index == 0 and self._fail_first_strict_read and strict:
+            # Fresh-retryable infra read failure on the eval output read: with
+            # strict=True the real E2BSandbox.read_file would re-raise this, so
+            # the fake models that by raising directly. is_fresh_sandbox_retryable
+            # classifies ReadError as retryable -> run_evaluation boots a fresh sb.
+            raise _exc("ReadError", "output read stream broke")
+        return self.files.get(path, self._out_payload)
+
+
+def _swebench_md() -> dict:
+    """swebench metadata routing run_evaluation -> _grade_swebench."""
+    return {
+        "protocol": "swebench",
+        "instance_id": "sweb-inst-1",
+        "image": "img",
+        "workdir": "/testbed",
+        "grading": {"sweb_instance": {"instance_id": "sweb-inst-1"}},
+    }
+
+
+def _patch_swebench_grader(monkeypatch, registry, *, resolved, out_payload, fail_first_strict_read):
+    """Stub only the swebench-package leaves + E2BSandbox so the REAL
+    _grade_swebench sandbox/exec_and_wait path runs on the CPU env."""
+    monkeypatch.setattr(swe_mod, "_SWEBENCH_IMPORT_ERROR", None, raising=False)
+
+    class _FakeTS:
+        eval_script = "#!/bin/bash\necho grading\n"
+
+    monkeypatch.setattr(swe_mod, "_build_test_spec", lambda inst: _FakeTS())
+
+    async def _apply_ok(ev, workdir):
+        return True
+
+    monkeypatch.setattr(swe_mod, "_apply_model_patch", _apply_ok)
+
+    def _report(ts, instance_id, diff_text, log):
+        # Prove the grader received the second sandbox's real output log.
+        assert log == out_payload, f"grader saw wrong log: {log!r}"
+        return {instance_id: {"resolved": resolved, "patch_successfully_applied": True}}
+
+    monkeypatch.setattr(swe_mod, "_eval_report_from_log", _report)
+
+    monkeypatch.setattr(
+        swe_mod,
+        "E2BSandbox",
+        lambda image, **kw: _SwebenchLifecycleSandbox(
+            image, registry, out_payload=out_payload, fail_first_strict_read=fail_first_strict_read
+        ),
+    )
+
+
+def test_swebench_strict_output_failure_triggers_fresh_sandbox_retry(monkeypatch):
+    """REAL chain: run_evaluation -> _run_evaluation_once -> _grade_swebench ->
+    real exec_and_wait(strict_output=True) -> sb.read_file(strict=True).
+
+    The first evaluator sandbox's strict output read raises a fresh-retryable
+    ReadError; that must propagate out of _grade_swebench and cause
+    run_evaluation(max_attempts=2) to boot a DISTINCT second sandbox that reads
+    the real eval log and grades resolved -> reward=1.0. Both sandboxes are
+    cleaned up, and strict_output=True is proven to have reached read_file."""
+    registry = []
+    _patch_swebench_grader(
+        monkeypatch,
+        registry,
+        resolved=True,
+        out_payload="grading-log-output",
+        fail_first_strict_read=True,
+    )
+
+    async def run():
+        return await swe_mod.run_evaluation(_swebench_md(), diff_text="the-model-diff", timeout_sec=10, max_attempts=2)
+
+    result = asyncio.run(run())
+
+    # Retry recovered a real grade rather than a false empty-log reward=0.
+    assert result.reward == 1.0
+    # Two attempts -> two DISTINCT sandboxes, both entered and cleaned up.
+    assert len(registry) == 2
+    assert registry[0] is not registry[1]
+    assert registry[0].sandbox_id != registry[1].sandbox_id
+    assert registry[0].entered and registry[0].exited
+    assert registry[1].entered and registry[1].exited
+    # strict_output=True was forwarded as read_file(strict=True) on BOTH the
+    # failing first read and the successful second read -- the whole point.
+    first_strict = [s for _p, s in registry[0].read_strict_flags]
+    second_strict = [s for _p, s in registry[1].read_strict_flags]
+    assert first_strict and all(first_strict), "first sandbox never got strict=True output read"
+    assert second_strict and all(second_strict), "second sandbox never got strict=True output read"
+
+
+def test_swebench_strict_output_single_sandbox_when_read_succeeds(monkeypatch):
+    """Control: when the strict output read does not fail, exactly ONE sandbox
+    is created (no retry) and it still receives read_file(strict=True) -- so the
+    retry in the sibling test is caused by the read failure, not by always
+    double-booting."""
+    registry = []
+    _patch_swebench_grader(
+        monkeypatch,
+        registry,
+        resolved=True,
+        out_payload="grading-log-output",
+        fail_first_strict_read=False,
+    )
+
+    async def run():
+        return await swe_mod.run_evaluation(_swebench_md(), diff_text="the-model-diff", timeout_sec=10, max_attempts=2)
+
+    result = asyncio.run(run())
+    assert result.reward == 1.0
+    assert len(registry) == 1  # clean first grade -> no retry
+    assert registry[0].entered and registry[0].exited
+    strict_flags = [s for _p, s in registry[0].read_strict_flags]
+    assert strict_flags and all(strict_flags), "output read must be strict=True even on the happy path"
