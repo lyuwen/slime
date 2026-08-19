@@ -119,6 +119,32 @@ def test_retry_config_rejects_non_integer_value():
             SweConfig.from_env()
 
 
+def test_retry_min_budget_defaults_to_half_agent_budget(monkeypatch):
+    monkeypatch.setenv("SWE_AGENT_TIME_BUDGET_SEC", "1800")
+    monkeypatch.delenv("SWE_AGENT_RETRY_MIN_BUDGET_SEC", raising=False)
+    cfg = SweConfig.from_env()
+    assert cfg.retry_min_budget_sec == 900.0
+
+
+def test_retry_min_budget_explicit_override(monkeypatch):
+    monkeypatch.setenv("SWE_AGENT_TIME_BUDGET_SEC", "1800")
+    monkeypatch.setenv("SWE_AGENT_RETRY_MIN_BUDGET_SEC", "300")
+    cfg = SweConfig.from_env()
+    assert cfg.retry_min_budget_sec == 300.0
+
+
+def test_retry_min_budget_zero_allowed(monkeypatch):
+    monkeypatch.setenv("SWE_AGENT_RETRY_MIN_BUDGET_SEC", "0")
+    cfg = SweConfig.from_env()
+    assert cfg.retry_min_budget_sec == 0.0
+
+
+def test_retry_min_budget_negative_rejected(monkeypatch):
+    monkeypatch.setenv("SWE_AGENT_RETRY_MIN_BUDGET_SEC", "-1")
+    with pytest.raises(ValueError):
+        SweConfig.from_env()
+
+
 def test_retry_policy_default():
     import os
 

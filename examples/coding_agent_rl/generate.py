@@ -74,6 +74,7 @@ class SweConfig:
     boot_retries: int
     rollout_retries: int
     retry_policy: str
+    retry_min_budget_sec: float
     oh_fake_user: bool
     oh_max_iterations: int
     oh_tools: list[str]
@@ -106,6 +107,10 @@ class SweConfig:
                 f"SWE_ROLLOUT_RETRY_POLICY={retry_policy!r} invalid; "
                 f"must be pre-launch|retry-from-scratch|always-fail"
             )
+        _min_budget_env = os.environ.get("SWE_AGENT_RETRY_MIN_BUDGET_SEC")
+        retry_min_budget_sec = float(_min_budget_env) if _min_budget_env else 0.5 * agent_time_budget
+        if retry_min_budget_sec < 0:
+            raise ValueError("SWE_AGENT_RETRY_MIN_BUDGET_SEC must be >= 0")
         return cls(
             eval_protocol=os.environ.get("SWE_EVAL_PROTOCOL", swe.PROTOCOL_SCALESWE),
             train_protocol=os.environ.get("SWE_TRAIN_PROTOCOL", swe.PROTOCOL_SCALESWE),
@@ -121,6 +126,7 @@ class SweConfig:
             boot_retries=int(os.environ.get("SWE_BOOT_RETRIES", "2")),
             rollout_retries=rollout_retries,
             retry_policy=retry_policy,
+            retry_min_budget_sec=retry_min_budget_sec,
             oh_fake_user=os.environ.get("SWE_OH_FAKE_USER", "0") not in ("0", "", "false", "False"),
             oh_max_iterations=int(os.environ.get("SWE_OH_MAX_ITERATIONS", "100")),
             oh_tools=oh_tools,
