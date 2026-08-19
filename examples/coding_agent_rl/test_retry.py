@@ -84,6 +84,29 @@ def test_is_retryable_non_retryable():
     assert not _is_retryable(ValueError("invalid config"))
 
 
+def test_permanent_sandbox_exception_not_resurrected_by_create_heuristic():
+    # FIX A: the kernel classifier rejects a permanent auth SandboxException, and
+    # the word "create" in the message must NOT flip it back to retryable via the
+    # fallthrough heuristic. is_fresh_sandbox_retryable is the single source of
+    # truth for SandboxException.
+    assert not _is_retryable(SandboxException("unauthorized to create sandbox"))
+
+
+def test_transient_sandbox_exception_still_retryable():
+    # A transient SandboxException (missing/stopped sandbox) stays retryable.
+    assert _is_retryable(SandboxException("sandbox does not exist"))
+
+
+def test_transient_boot_sandbox_exception_retryable_via_classifier_only():
+    # Boot/create failures CAN surface as SandboxException (AsyncSandbox.create
+    # raises it). A generic transient provider/gateway boot failure must stay
+    # retryable — and the message here deliberately contains NO fallthrough
+    # heuristic keyword (no "boot"/"create"/"connection"/"e2b"/"sandbox"...), so
+    # the only path that can classify it retryable is the kernel classifier at
+    # the top of _is_retryable. If that call were removed, this fails.
+    assert _is_retryable(SandboxException("502 bad gateway from provider"))
+
+
 def test_retry_config_rejects_negative_value():
     with patch.dict("os.environ", {"SWE_ROLLOUT_RETRIES": "-1"}):
         with pytest.raises(ValueError, match="must be non-negative"):
@@ -642,3 +665,58 @@ async def test_always_fail_policy_aborts_on_first_retryable_error(base_patches):
 
     assert base_patches["mock_harness_inst"].run.await_count == 1
     assert result == ["exception:RuntimeError"]
+
+
+@pytest.mark.anyio
+async def test_always_fail_policy_aborts_provisioning_without_boot_retries():
+    """FIX B: under always-fail, a retryable *provisioning* error inside
+    boot_agent_sandbox must fail immediately — boot_agent_sandbox's own internal
+    retry loop (CONFIG.boot_retries) must NOT retry it. The real boot loop runs
+    (boot_agent_sandbox is NOT patched); only E2BSandbox construction/entry is
+    patched to raise. Asserts the sandbox is created exactly ONCE despite
+    boot_retries defaulting to 2.
+    """
+    from examples.coding_agent_rl import generate as gen_mod
+    from examples.coding_agent_rl.generate import generate
+
+    async def fast_sleep(_):
+        pass
+
+    state = _make_state_mock()
+
+    fake_sb = MagicMock()
+    fake_sb.__aenter__ = AsyncMock(side_effect=SandboxException("does not exist: provisioning gateway"))
+    fake_sb.__aexit__ = AsyncMock(return_value=None)
+
+    fake_e2b_cls = MagicMock(return_value=fake_sb)
+
+    mock_harness_inst = AsyncMock()
+    mock_harness_inst.install_cli = AsyncMock()
+    mock_harness_cls = MagicMock(return_value=mock_harness_inst)
+
+    mock_swe = MagicMock()
+    mock_swe.get_metadata.return_value = _make_sample_mock().metadata["swe_metadata"]
+    mock_swe.evaluability_check.return_value = None
+    mock_swe.prepare_workspace = AsyncMock()
+
+    with (
+        patch("examples.coding_agent_rl.generate._AdapterService", return_value=state),
+        patch("examples.coding_agent_rl.generate.E2BSandbox", fake_e2b_cls),
+        patch("examples.coding_agent_rl.generate.HARNESS_CLS", mock_harness_cls),
+        patch("examples.coding_agent_rl.generate.swe", mock_swe),
+        patch("examples.coding_agent_rl.generate._session_id", return_value="sess-123"),
+        patch("examples.coding_agent_rl.generate.get_prompt", return_value="prompt"),
+        patch("examples.coding_agent_rl.generate._abort_result", side_effect=lambda s, r, i: [r]),
+        patch.object(
+            gen_mod,
+            "CONFIG",
+            replace(gen_mod.CONFIG, retry_policy="always-fail", boot_retries=2, rollout_retries=2),
+        ),
+        patch("examples.coding_agent_rl.generate.asyncio.sleep", side_effect=fast_sleep),
+    ):
+        result = await generate(MagicMock(), _make_sample_mock(), {})
+
+    # Provisioning attempted exactly once: boot_retries did NOT loop under always-fail.
+    assert fake_e2b_cls.call_count == 1
+    assert fake_sb.__aenter__.await_count == 1
+    assert result == ["exception:SandboxException"]

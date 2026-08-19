@@ -241,6 +241,10 @@ async def boot_agent_sandbox(image: str, instance_id: str) -> AsyncIterator[E2BS
             break
         except Exception as e:
             last_err = e
+            # always-fail policy fails any exception immediately (README/design):
+            # do not consume the internal boot_retries budget under this policy.
+            if CONFIG.retry_policy == "always-fail":
+                raise
             logger.warning(
                 "[coding_agent_rl] %s: provision attempt %d/%d failed: %s: %s",
                 instance_id,
@@ -316,6 +320,12 @@ def _is_retryable(e: Exception) -> bool:
     # SandboxException / E2B transport errors. Consult it first.
     if is_fresh_sandbox_retryable(e):
         return True
+    # For a SandboxException the kernel classifier is authoritative in BOTH
+    # directions: it already returns True for transient provider errors and
+    # False for the permanent auth/quota/billing denylist. Do not let the
+    # message heuristics below (e.g. "create") resurrect a rejected one.
+    if type(e).__name__ == "SandboxException":
+        return False
 
     msg = str(e).lower()
     exc_type = type(e).__name__.lower()
