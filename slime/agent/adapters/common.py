@@ -516,6 +516,13 @@ async def call_sglang_generate(
         output_ids = [x[1] for x in output_token_logprobs]
         output_log_probs = [float(x[0]) for x in output_token_logprobs]
         finish = (meta.get("finish_reason") or {}).get("type", "stop") or "stop"
+        # Token-count stats from sglang meta_info. prompt_tokens and
+        # completion_tokens are standard sglang fields; cached_tokens is only
+        # populated when the server runs with --enable-cache-report.
+        # completion_tokens is derived from output_ids (always accurate).
+        prompt_tokens = int(meta.get("prompt_tokens") or 0)
+        cached_tokens = int(meta.get("cached_tokens") or 0)
+        completion_tokens = len(output_ids)
     except (asyncio.CancelledError, aiohttp.ClientError, asyncio.TimeoutError) as e:
         # free the sglang slot eagerly on client cancel/timeout, else the
         # orphaned generation keeps occupying KV until its own length cap
@@ -532,6 +539,9 @@ async def call_sglang_generate(
         output_ids=output_ids,
         finish_reason=finish,
         output_log_probs=output_log_probs,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        cached_tokens=cached_tokens,
     )
 
 

@@ -220,12 +220,24 @@ def drift_replace(ids: list[int], at: int, sentinel: int = _DRIFT_BAND + 2) -> l
     return out
 
 
-def turn(prompt_ids, response_ids, *, finish_reason="stop", logprobs=None) -> TurnRecord:
+def turn(
+    prompt_ids,
+    response_ids,
+    *,
+    finish_reason="stop",
+    logprobs=None,
+    prompt_tokens=0,
+    completion_tokens=0,
+    cached_tokens=0,
+) -> TurnRecord:
     return TurnRecord(
         prompt_ids=list(prompt_ids),
         output_ids=list(response_ids),
         finish_reason=finish_reason,
         output_log_probs=list(logprobs) if logprobs is not None else [],
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        cached_tokens=cached_tokens,
     )
 
 
@@ -1269,6 +1281,127 @@ def test_4_6_drift_B1_threshold_boundary():
     _check_invariants(forked)
     _check_invariants(replaced)
     print("PASS 4.6")
+
+
+def test_4_7_cache_stats_accumulate_on_single_chain():
+    """sglang token-count stats (prompt/completion/cached) sum across every turn
+    folded into one Sample and land on ``prefix_cache_info``. This is what feeds
+    rollout's ``avg_cached_tokens_per_sample`` / ``prefix_cache_hit_rate``."""
+    mgr = TrajectoryManager()
+    sid = "4.7"
+    s, u = sys_msg("S"), usr_msg("compute")
+    a1, t1 = asst_msg("call"), tool_msg("4")
+    p1 = render_prompt([s, u])
+    p2 = render_prompt([s, u, a1, t1])
+    r1, r2 = render_response("call"), render_response("done")
+    mgr.record_turn(
+        sid,
+        turn=turn(
+            p1, r1, finish_reason="tool_calls", prompt_tokens=len(p1), completion_tokens=len(r1), cached_tokens=0
+        ),
+        prompt_messages=messages([s, u]),
+        response_message={"role": "assistant", "content": "call"},
+    )
+    mgr.record_turn(
+        sid,
+        turn=turn(p2, r2, prompt_tokens=len(p2), completion_tokens=len(r2), cached_tokens=len(p1)),
+        prompt_messages=messages([s, u, a1, t1]),
+        response_message={"role": "assistant", "content": "done"},
+    )
+    samples = get_traj(mgr, sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
+    assert len(samples) == 1
+    info = samples[0].prefix_cache_info
+    assert info.cached_tokens == len(p1)
+    assert info.total_prompt_tokens == len(p1) + len(p2)
+    assert info.completion_tokens == len(r1) + len(r2)
+    _check_invariants(samples)
+    print("PASS 4.7")
+
+
+def test_4_9_cache_stats_not_double_counted_on_shared_prefix():
+    """A shared assistant turn (trained on first leaf, loss=0 context on second)
+    must contribute stats to exactly one sample, not both.  The cross-leaf dedup
+    topology from 2.10 is reused: s+u -> r:call (shared) -> two tool branches
+    -> r:a2 / r:a3.  The shared r:call has nonzero stats; the per-leaf turns
+    have distinct stats.  After get_trajectory the sum of cached_tokens across
+    both emitted samples must equal the total of unique sglang calls (each call
+    counted once), not twice the shared call's cost."""
+    mgr = TrajectoryManager()
+    sid = "4.9"
+    s, u, a1 = sys_msg("S"), usr_msg("u"), asst_msg("call")
+    tx, ty = tool_msg("x"), tool_msg("y")
+    p1 = render_prompt([s, u])
+    r1 = render_response("call")
+    # shared turn: prompt_tokens=len(p1), cached_tokens=5
+    mgr.record_turn(
+        sid,
+        turn=turn(p1, r1, finish_reason="tool_calls", prompt_tokens=len(p1), cached_tokens=5),
+        prompt_messages=messages([s, u]),
+        response_message={"role": "assistant", "content": "call"},
+    )
+    p2 = render_prompt([s, u, a1, tx])
+    r2 = render_response("a2")
+    # leaf 1: cached_tokens=10
+    mgr.record_turn(
+        sid,
+        turn=turn(p2, r2, prompt_tokens=len(p2), cached_tokens=10),
+        prompt_messages=messages([s, u, a1, tx]),
+        response_message={"role": "assistant", "content": "a2"},
+    )
+    p3 = render_prompt([s, u, a1, ty])
+    r3 = render_response("a3")
+    # leaf 2: cached_tokens=8
+    mgr.record_turn(
+        sid,
+        turn=turn(p3, r3, prompt_tokens=len(p3), cached_tokens=8),
+        prompt_messages=messages([s, u, a1, ty]),
+        response_message={"role": "assistant", "content": "a3"},
+    )
+    samples = get_traj(mgr, sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
+    assert len(samples) == 2
+    total_cached = sum(sm.prefix_cache_info.cached_tokens for sm in samples)
+    # shared (5) counted once + leaf1 (10) + leaf2 (8) = 23
+    assert (
+        total_cached == 5 + 10 + 8
+    ), f"shared-prefix stats double-counted: total cached={total_cached}, expected {5+10+8}"
+    for sm in samples:
+        _check_invariants([sm])
+    print("PASS 4.9")
+
+
+def test_4_8_cache_stats_split_across_forked_samples():
+    """When a session forks into multiple Samples, each Sample carries only the
+    stats of the turns folded into it -- stats are not double-counted across
+    leaves. Reuses the fork setup from 2.8."""
+    mgr = TrajectoryManager()
+    sid = "4.8"
+    s = sys_msg("S")
+    u1, u2 = usr_msg("q1"), usr_msg("q2")
+    p1 = render_prompt([s, u1])
+    p2 = render_prompt([s, u2])
+    mgr.record_turn(
+        sid,
+        turn=turn(p1, render_response("a1"), prompt_tokens=len(p1), cached_tokens=1),
+        prompt_messages=messages([s, u1]),
+        response_message={"role": "assistant", "content": "a1"},
+    )
+    mgr.record_turn(
+        sid,
+        turn=turn(p2, render_response("a2"), prompt_tokens=len(p2), cached_tokens=2),
+        prompt_messages=messages([s, u2]),
+        response_message={"role": "assistant", "content": "a2"},
+    )
+    samples = get_traj(mgr, sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
+    assert len(samples) == 2, f"user fork must yield 2 samples, got {len(samples)}"
+    # Each leaf saw exactly one turn; cached totals stay separated (1 and 2), and
+    # the sum matches what a single aggregate would report -- no double-count.
+    cached = sorted(sm.prefix_cache_info.cached_tokens for sm in samples)
+    assert cached == [1, 2]
+    prompt_totals = sorted(sm.prefix_cache_info.total_prompt_tokens for sm in samples)
+    assert prompt_totals == sorted([len(p1), len(p2)])
+    for sm in samples:
+        _check_invariants([sm])
+    print("PASS 4.8")
 
 
 # ===========================================================================

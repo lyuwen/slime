@@ -86,6 +86,7 @@ def test_to_dict_flattens_spec_info_and_prefix_cache_info():
     sample.spec_info.spec_draft_token_num = 20
     sample.prefix_cache_info.cached_tokens = 5
     sample.prefix_cache_info.total_prompt_tokens = 50
+    sample.prefix_cache_info.completion_tokens = 15
 
     d = sample.to_dict()
     assert d["spec_info"] == {
@@ -94,7 +95,11 @@ def test_to_dict_flattens_spec_info_and_prefix_cache_info():
         "spec_verify_ct": 0,
         "completion_token_num": 0,
     }
-    assert d["prefix_cache_info"] == {"cached_tokens": 5, "total_prompt_tokens": 50}
+    assert d["prefix_cache_info"] == {
+        "cached_tokens": 5,
+        "total_prompt_tokens": 50,
+        "completion_tokens": 15,
+    }
 
 
 @pytest.mark.unit
@@ -247,7 +252,7 @@ def test_prefix_cache_info_is_accumulated_across_calls():
     (types.py:171). Multi-turn rollouts call this once per turn — the
     counts must accumulate, not overwrite."""
     sample = Sample()
-    for prompt_tokens, cached_tokens in [(100, 0), (200, 50)]:
+    for prompt_tokens, cached_tokens, completion_tokens in [(100, 0, 30), (200, 50, 40)]:
         sample.append_response_tokens(
             _make_args(),
             tokens=[],
@@ -256,10 +261,12 @@ def test_prefix_cache_info_is_accumulated_across_calls():
                 "finish_reason": {"type": "stop"},
                 "prompt_tokens": prompt_tokens,
                 "cached_tokens": cached_tokens,
+                "completion_tokens": completion_tokens,
             },
         )
     assert sample.prefix_cache_info.cached_tokens == 50  # 0 + 50
     assert sample.prefix_cache_info.total_prompt_tokens == 300  # 100 + 200
+    assert sample.prefix_cache_info.completion_tokens == 70  # 30 + 40
 
 
 @pytest.mark.unit
