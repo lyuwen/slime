@@ -419,6 +419,49 @@ def test_mid_list_system_folds_into_user():
 
 
 # ===========================================================================
+# §7 parsing helpers (slime.agent.parsing)
+# ===========================================================================
+
+
+def test_parse_model_output_plain_text_no_parsers():
+    parsed = parse_model_output("just text", tools_schema=None, tool_parser_name=None, reasoning_parser_name=None)
+    assert parsed.text == "just text"
+    assert parsed.tool_uses == []
+    assert parsed.reasoning == ""
+
+
+def test_parse_model_output_think_split_fallback():
+    # The qwen3 reasoning parser lives in sglang (lazy import); skip where the
+    # lean CPU CI env has no sglang installed.
+    pytest.importorskip("sglang")
+    parsed = parse_model_output(
+        "<think>reason here</think>visible",
+        tools_schema=None,
+        tool_parser_name=None,
+        reasoning_parser_name="qwen3",
+    )
+    # the qwen3 reasoning parser (or the </think> fallback) splits reasoning out.
+    assert "visible" in parsed.text
+    assert "reason here" in parsed.reasoning
+
+
+def test_parse_xml_tool_uses_fallback():
+    raw = "lead <tool_call><function=lookup><parameter=q>slime</parameter></function></tool_call> tail"
+    schema = [{"function": {"name": "lookup"}}]
+    cleaned, uses = parse_xml_tool_uses(raw, schema)
+    assert uses == [{"name": "lookup", "input": {"q": "slime"}}]
+    assert "<tool_call>" not in cleaned
+    assert "lead" in cleaned and "tail" in cleaned
+
+
+def test_parse_xml_tool_uses_ignores_unknown_tool():
+    raw = "<tool_call><function=unknown><parameter=q>x</parameter></function></tool_call>"
+    cleaned, uses = parse_xml_tool_uses(raw, [{"function": {"name": "lookup"}}])
+    assert uses == []
+    assert "<tool_call>" in cleaned  # left untouched
+
+
+# ===========================================================================
 # §8 cache token pass-through (sglang --enable-cache-report)
 # ===========================================================================
 
@@ -561,47 +604,6 @@ def test_no_cache_field_when_cached_tokens_zero():
         assert "cache_read_input_tokens" not in data["usage"]
 
     asyncio.run(run_case())
-
-
-# ===========================================================================
-
-
-def test_parse_model_output_plain_text_no_parsers():
-    parsed = parse_model_output("just text", tools_schema=None, tool_parser_name=None, reasoning_parser_name=None)
-    assert parsed.text == "just text"
-    assert parsed.tool_uses == []
-    assert parsed.reasoning == ""
-
-
-def test_parse_model_output_think_split_fallback():
-    # The qwen3 reasoning parser lives in sglang (lazy import); skip where the
-    # lean CPU CI env has no sglang installed.
-    pytest.importorskip("sglang")
-    parsed = parse_model_output(
-        "<think>reason here</think>visible",
-        tools_schema=None,
-        tool_parser_name=None,
-        reasoning_parser_name="qwen3",
-    )
-    # the qwen3 reasoning parser (or the </think> fallback) splits reasoning out.
-    assert "visible" in parsed.text
-    assert "reason here" in parsed.reasoning
-
-
-def test_parse_xml_tool_uses_fallback():
-    raw = "lead <tool_call><function=lookup><parameter=q>slime</parameter></function></tool_call> tail"
-    schema = [{"function": {"name": "lookup"}}]
-    cleaned, uses = parse_xml_tool_uses(raw, schema)
-    assert uses == [{"name": "lookup", "input": {"q": "slime"}}]
-    assert "<tool_call>" not in cleaned
-    assert "lead" in cleaned and "tail" in cleaned
-
-
-def test_parse_xml_tool_uses_ignores_unknown_tool():
-    raw = "<tool_call><function=unknown><parameter=q>x</parameter></function></tool_call>"
-    cleaned, uses = parse_xml_tool_uses(raw, [{"function": {"name": "lookup"}}])
-    assert uses == []
-    assert "<tool_call>" in cleaned  # left untouched
 
 
 # ---------------------------------------------------------------------------
