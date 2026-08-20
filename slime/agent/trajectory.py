@@ -36,6 +36,9 @@ class TurnRecord:
     finish_reason: str
     output_log_probs: list[float] = dataclasses.field(default_factory=list)
     ill_formed: bool = False
+    # True when the turn's tool call was still invalid after exhausting retries
+    # (the adapter accepted the last candidate). Surfaced in sample metadata.
+    invalid_tool_call: bool = False
     # Token-count stats from sglang meta_info (zero when the server does not
     # report them, e.g. --enable-cache-report off, or on the early-exit path).
     prompt_tokens: int = 0
@@ -508,11 +511,13 @@ class TrajectoryManager:
         truncated = bool(asst_nodes) and asst_nodes[-1].turn.finish_reason == "length"
         use_tool = any(bool((n.message or {}).get("tool_calls")) for n in asst_nodes)
         ill_formed = any(n.turn.ill_formed for n in asst_nodes)
+        invalid_tool_call = any(n.turn.invalid_tool_call for n in asst_nodes)
         md = {
             **(extra_metadata or {}),
             "truncated": truncated,
             "use_tool": use_tool,
             "ill_formed": ill_formed,
+            "invalid_tool_call": invalid_tool_call,
         }
         samples: list[Sample] = []
         for builder in self._split_chain_into_builders(chain):

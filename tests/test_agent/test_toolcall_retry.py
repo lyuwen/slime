@@ -25,5 +25,15 @@ def test_open_session_defaults_is_eval_false_and_accepts_flag():
     assert adapter.store["s-eval"].is_eval is True
 
 
+from slime.agent.trajectory import TurnRecord  # noqa: E402
+
+
+def test_turn_record_has_invalid_tool_call_default_false():
+    tr = TurnRecord(prompt_ids=[1], output_ids=[2], finish_reason="stop")
+    assert tr.invalid_tool_call is False
+    tr2 = TurnRecord(prompt_ids=[1], output_ids=[2], finish_reason="stop", invalid_tool_call=True)
+    assert tr2.invalid_tool_call is True
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
