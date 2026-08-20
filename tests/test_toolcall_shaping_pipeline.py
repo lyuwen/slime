@@ -146,6 +146,18 @@ def test_convert_mixed_batch_fills_absent_with_zeros():
     assert td["toolcall_turn_shaping"][1] == [0.0, -0.5]
 
 
+def test_shaping_survives_convert_with_loss_mask_shape():
+    """Per-sample shaping vectors match loss_mask lengths through convert."""
+    samples = [
+        _sample(0, 3, [0.0, -0.5, -0.5]),
+        _sample(1, 2, [0.0, -0.1]),
+    ]
+    td = _convert(samples)
+    assert "toolcall_turn_shaping" in td
+    for shp, lm in zip(td["toolcall_turn_shaping"], td["loss_masks"], strict=True):
+        assert len(shp) == len(lm)
+
+
 def test_cp_slice_included_for_shaping_key():
     """The _get_rollout_data field loop must list toolcall_turn_shaping so it is
     CP-sliced and tensorized alongside rollout_log_probs.
