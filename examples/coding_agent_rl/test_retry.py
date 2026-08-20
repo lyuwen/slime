@@ -145,6 +145,13 @@ def test_retry_min_budget_negative_rejected(monkeypatch):
         SweConfig.from_env()
 
 
+def test_retry_min_budget_empty_string_uses_default(monkeypatch):
+    monkeypatch.setenv("SWE_AGENT_TIME_BUDGET_SEC", "1800")
+    monkeypatch.setenv("SWE_AGENT_RETRY_MIN_BUDGET_SEC", "")
+    cfg = SweConfig.from_env()
+    assert cfg.retry_min_budget_sec == 900.0
+
+
 def test_retry_policy_default():
     import os
 
@@ -862,3 +869,7 @@ async def test_budget_gate_allows_retry_when_budget_ample(monkeypatch):
     # All attempts consumed: initial + 2 retries = 3 provisioning attempts.
     assert fake_e2b_cls.call_count == 3
     assert result == ["exception:RuntimeError"]
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])
