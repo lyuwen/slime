@@ -40,6 +40,8 @@ class Session:
 
     sampling_defaults: dict = dataclasses.field(default_factory=dict)
     max_context_tokens: int = 0
+    # True for eval rollouts: disables tool-call retry so eval measures raw output.
+    is_eval: bool = False
 
 
 @dataclasses.dataclass
@@ -218,6 +220,7 @@ class BaseAdapter:
         *,
         sampling_defaults: dict | None = None,
         max_context_tokens: int = 0,
+        is_eval: bool = False,
     ) -> None:
         """Register a fresh per-sid Session; sids must be unique."""
         if sid in self.store:
@@ -225,6 +228,7 @@ class BaseAdapter:
         self.store[sid] = Session(
             sampling_defaults=dict(sampling_defaults or {}),
             max_context_tokens=int(max_context_tokens or 0),
+            is_eval=bool(is_eval),
         )
 
     async def shutdown_session(self, sid: str, *, wait_timeout: float = 5.0) -> None:
