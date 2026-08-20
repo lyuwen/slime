@@ -66,11 +66,11 @@ class OpenAIAdapter(BaseAdapter):
             wire=(wire_message, wire_finish),
         )
 
-    async def _respond(self, request, body, reply, in_tok, out_tok, stream) -> web.StreamResponse:
+    async def _respond(self, request, body, reply, in_tok, out_tok, stream, cached_tok: int = 0) -> web.StreamResponse:
         wire_message, wire_finish = reply.wire
         if stream:
-            return await _render_stream(request, body, wire_message, wire_finish, in_tok, out_tok)
-        return web.json_response(_render_response(body, wire_message, wire_finish, in_tok, out_tok))
+            return await _render_stream(request, body, wire_message, wire_finish, in_tok, out_tok, cached_tok)
+        return web.json_response(_render_response(body, wire_message, wire_finish, in_tok, out_tok, cached_tok))
 
 
 # --- Translation (OpenAI wire -> chat-template messages) ---
@@ -290,12 +290,15 @@ def _request_session_id(request: web.Request, body: dict) -> str:
     return sid_from_bearer(request) or sid_from_body(body) or "default"
 
 
-def _usage(in_tok: int, out_tok: int) -> dict[str, int]:
-    return {
+def _usage(in_tok: int, out_tok: int, cached_tok: int = 0) -> dict[str, Any]:
+    usage: dict[str, Any] = {
         "prompt_tokens": in_tok,
         "completion_tokens": out_tok,
         "total_tokens": in_tok + out_tok,
     }
+    if cached_tok > 0:  # only set when sglang runs with --enable-cache-report
+        usage["prompt_tokens_details"] = {"cached_tokens": cached_tok}
+    return usage
 
 
 def _render_response(
@@ -304,6 +307,7 @@ def _render_response(
     wire_finish: str,
     in_tok: int,
     out_tok: int,
+    cached_tok: int = 0,
 ) -> dict[str, Any]:
     return {
         "id": f"chatcmpl_{secrets.token_hex(12)}",
@@ -317,7 +321,7 @@ def _render_response(
                 "finish_reason": wire_finish,
             }
         ],
-        "usage": _usage(in_tok, out_tok),
+        "usage": _usage(in_tok, out_tok, cached_tok),
     }
 
 
@@ -328,6 +332,7 @@ async def _render_stream(
     wire_finish: str,
     in_tok: int,
     out_tok: int,
+    cached_tok: int = 0,
 ) -> web.StreamResponse:
     """Emit the OpenAI Chat-Completions SSE stream.
 
@@ -373,6 +378,6 @@ async def _render_stream(
     tool_calls = wire_message.get("tool_calls") or []
     if tool_calls:
         await emit({"tool_calls": [{**call, "index": idx} for idx, call in enumerate(tool_calls)]})
-    await emit({}, finish_reason=wire_finish, usage=_usage(in_tok, out_tok))
+    await emit({}, finish_reason=wire_finish, usage=_usage(in_tok, out_tok, cached_tok))
     await out.write(b"data: [DONE]\n\n")
     return out
