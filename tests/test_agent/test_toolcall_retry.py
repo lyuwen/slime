@@ -102,8 +102,6 @@ def test_toolcall_retry_args_have_expected_defaults():
     assert "--tool-call-max-retries" in src
 
 
-import dataclasses  # noqa: E402
-
 from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
 
 from slime.agent.adapters.common import TurnRecord as _TR  # noqa: E402
@@ -162,8 +160,7 @@ async def _run_one_turn(adapter, sid):
         resp = await client.post(
             "/v1/chat/completions",
             headers={"Authorization": f"Bearer {sid}"},
-            json={"model": "m", "max_tokens": 8, "tools": _TOOLS,
-                  "messages": [{"role": "user", "content": "go"}]},
+            json={"model": "m", "max_tokens": 8, "tools": _TOOLS, "messages": [{"role": "user", "content": "go"}]},
         )
         await resp.json()
     finally:
@@ -282,15 +279,17 @@ def test_validate_reply_matches_reference_polarity():
     adapter = _make_adapter(tok, validator=_find_invalid_tool_call_like_reference)
     session = common.Session(is_eval=False)
 
-    good = ParsedModelOutput(reasoning="", text="", tool_uses=[{"name": "good_tool", "input": {"a": 1}}], ill_formed=False)
+    good = ParsedModelOutput(
+        reasoning="", text="", tool_uses=[{"name": "good_tool", "input": {"a": 1}}], ill_formed=False
+    )
     assert adapter._validate_reply(good, session) is None
 
     # A tool_use whose input isn't a dict becomes {"_raw_arguments": "..."} in the
     # wire call, which IS a JSON object -> reference treats it as valid.
     # To exercise the invalid branch, feed a raw non-JSON arguments string directly.
-    bad_dict = {"choices": [{"message": {"tool_calls": [
-        {"function": {"name": "good_tool", "arguments": "{not json"}}
-    ]}}]}
+    bad_dict = {
+        "choices": [{"message": {"tool_calls": [{"function": {"name": "good_tool", "arguments": "{not json"}}]}}]
+    }
     verdict = _find_invalid_tool_call_like_reference(bad_dict)
     assert verdict is not None and verdict[0] == "good_tool"
 
