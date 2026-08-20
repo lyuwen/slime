@@ -35,5 +35,25 @@ def test_turn_record_has_invalid_tool_call_default_false():
     assert tr2.invalid_tool_call is True
 
 
+from slime.agent.parsing import ParsedModelOutput  # noqa: E402
+
+
+def test_wire_tool_calls_returns_all_calls_as_json_string_args():
+    parsed = ParsedModelOutput(
+        reasoning="",
+        text="",
+        tool_uses=[
+            {"name": "a", "input": {"x": 1}},
+            {"name": "b", "input": {"y": 2}},
+        ],
+        ill_formed=False,
+    )
+    calls = openai._wire_tool_calls(parsed)
+    assert [c["function"]["name"] for c in calls] == ["a", "b"]
+    # arguments must be a JSON string (OpenAI wire shape), not a dict
+    assert calls[0]["function"]["arguments"] == '{"x": 1}'
+    assert calls[1]["function"]["arguments"] == '{"y": 2}'
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
