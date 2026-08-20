@@ -102,5 +102,152 @@ def test_toolcall_retry_args_have_expected_defaults():
     assert "--tool-call-max-retries" in src
 
 
+import dataclasses  # noqa: E402
+
+from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
+
+from slime.agent.adapters.common import TurnRecord as _TR  # noqa: E402
+from slime.utils.types import Sample  # noqa: E402
+
+# A tool schema the adapter will advertise; parsing needs a known tool name.
+_TOOLS = [
+    {"type": "function", "function": {"name": "good_tool", "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "bad_tool", "parameters": {"type": "object", "properties": {}}}},
+]
+
+
+def _reject_bad_tool(response_dict):
+    """Validator: invalid iff any tool call is named 'bad_tool'."""
+    for choice in response_dict.get("choices") or []:
+        for call in (choice.get("message") or {}).get("tool_calls") or []:
+            fn = call.get("function") or {}
+            if fn.get("name") == "bad_tool":
+                return (fn["name"], fn.get("arguments", ""))
+    return None
+
+
+def _scripted_generate(tokenizer, texts):
+    """Drop-in for common.call_sglang_generate yielding one scripted text per call.
+
+    Records how many times it was invoked on the returned closure's `.calls`.
+    """
+    queue = list(texts)
+    state = {"calls": 0}
+
+    async def _fake(prompt_ids, session, body, *, adapter, session_id=None):
+        state["calls"] += 1
+        assert queue, "unexpected generate call (script exhausted)"
+        text = queue.pop(0)
+        output_ids = tokenizer.encode(text)
+        return _TR(
+            prompt_ids=list(prompt_ids),
+            output_ids=output_ids,
+            finish_reason="stop",
+            output_log_probs=[0.0] * len(output_ids),
+        )
+
+    _fake.state = state
+    return _fake
+
+
+def _xml_call(name):
+    # parse_xml_tool_uses fallback shape; no parameters needed for these tools.
+    return f"<tool_call><function={name}></function></tool_call>"
+
+
+async def _run_one_turn(adapter, sid):
+    client = TestClient(TestServer(adapter.app))
+    await client.start_server()
+    try:
+        resp = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {sid}"},
+            json={"model": "m", "max_tokens": 8, "tools": _TOOLS,
+                  "messages": [{"role": "user", "content": "go"}]},
+        )
+        await resp.json()
+    finally:
+        await client.close()
+    return await adapter.finish_session(sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
+
+
+def _make_adapter(tok, validator=None, max_retries=3):
+    return openai.OpenAIAdapter(
+        tokenizer=tok,
+        sglang_url="http://unused",
+        tool_call_validator=validator,
+        tool_call_max_retries=max_retries,
+    )
+
+
+def test_retry_then_succeed_records_valid_candidate(monkeypatch):
+    async def run_case():
+        tok = FakeTokenizer()
+        gen = _scripted_generate(tok, [_xml_call("bad_tool"), _xml_call("good_tool")])
+        monkeypatch.setattr(common, "call_sglang_generate", gen)
+        adapter = _make_adapter(tok, validator=_reject_bad_tool)
+        adapter.open_session("s1")
+        samples = await _run_one_turn(adapter, "s1")
+        assert gen.state["calls"] == 2  # one retry
+        assert samples and all(s.metadata.get("invalid_tool_call") is False for s in samples)
+
+    asyncio.run(run_case())
+
+
+def test_exhaustion_accepts_last_and_flags_metadata(monkeypatch):
+    async def run_case():
+        tok = FakeTokenizer()
+        gen = _scripted_generate(tok, [_xml_call("bad_tool")] * 4)  # 1 + 3 retries
+        monkeypatch.setattr(common, "call_sglang_generate", gen)
+        adapter = _make_adapter(tok, validator=_reject_bad_tool, max_retries=3)
+        adapter.open_session("s2")
+        samples = await _run_one_turn(adapter, "s2")
+        assert gen.state["calls"] == 4
+        assert samples and any(s.metadata.get("invalid_tool_call") is True for s in samples)
+
+    asyncio.run(run_case())
+
+
+def test_valid_first_try_no_retry(monkeypatch):
+    async def run_case():
+        tok = FakeTokenizer()
+        gen = _scripted_generate(tok, [_xml_call("good_tool")])
+        monkeypatch.setattr(common, "call_sglang_generate", gen)
+        adapter = _make_adapter(tok, validator=_reject_bad_tool)
+        adapter.open_session("s3")
+        await _run_one_turn(adapter, "s3")
+        assert gen.state["calls"] == 1
+
+    asyncio.run(run_case())
+
+
+def test_eval_session_bypasses_retry(monkeypatch):
+    async def run_case():
+        tok = FakeTokenizer()
+        gen = _scripted_generate(tok, [_xml_call("bad_tool")])
+        monkeypatch.setattr(common, "call_sglang_generate", gen)
+        adapter = _make_adapter(tok, validator=_reject_bad_tool)
+        adapter.open_session("s4", is_eval=True)
+        samples = await _run_one_turn(adapter, "s4")
+        assert gen.state["calls"] == 1  # no retries in eval
+        # accepted as-is; flag not set because validation was skipped
+        assert samples and all(s.metadata.get("invalid_tool_call") is False for s in samples)
+
+    asyncio.run(run_case())
+
+
+def test_disabled_when_no_validator(monkeypatch):
+    async def run_case():
+        tok = FakeTokenizer()
+        gen = _scripted_generate(tok, [_xml_call("bad_tool")])
+        monkeypatch.setattr(common, "call_sglang_generate", gen)
+        adapter = _make_adapter(tok, validator=None)
+        adapter.open_session("s5")
+        await _run_one_turn(adapter, "s5")
+        assert gen.state["calls"] == 1  # feature inert
+
+    asyncio.run(run_case())
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

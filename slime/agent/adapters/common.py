@@ -153,6 +153,8 @@ class BaseAdapter:
         fork_threshold_tokens: int | None = None,
         chat_template_kwargs: dict | None = None,
         debug_callback: Callable[..., None] | None = None,
+        tool_call_validator: Callable[[dict], tuple[str, str] | None] | None = None,
+        tool_call_max_retries: int = 3,
     ) -> None:
         self.tokenizer = tokenizer
         self.sglang_url = sglang_url.rstrip("/") if isinstance(sglang_url, str) else sglang_url
@@ -172,6 +174,8 @@ class BaseAdapter:
         self.manager = TrajectoryManager(**mgr_kwargs)
 
         self.debug_callback: Callable[..., None] | None = debug_callback
+        self.tool_call_validator = tool_call_validator
+        self.tool_call_max_retries = int(tool_call_max_retries)
         # per-sid turn cap: return 429 to kill the run once exceeded
         self.max_turns_per_sid: int | None = max_turns_per_sid
         self._sid_turn_count: dict[str, int] = {}
@@ -199,6 +203,14 @@ class BaseAdapter:
     def _build_reply(self, parsed, raw_finish: str, translated: list[dict], tools_schema: list[dict] | None) -> Reply:
         """Pack parsed model output into a Reply."""
         raise NotImplementedError
+
+    def _validate_reply(self, parsed, session: Session) -> tuple[str, str] | None:
+        """Return None if the turn's tool calls are acceptable, else (name, reason).
+
+        Base adapter never rejects; OpenAIAdapter overrides this to run a
+        configured validator for training rollouts.
+        """
+        return None
 
     async def _respond(
         self,
@@ -356,17 +368,43 @@ class BaseAdapter:
                 chat_template_kwargs=self.chat_template_kwargs,
             )
 
-            turn = await call_sglang_generate(prompt_ids, s, body, adapter=self, session_id=sid)
+            verdict: tuple[str, str] | None = None
+            for attempt in range(self.tool_call_max_retries + 1):
+                turn = await call_sglang_generate(prompt_ids, s, body, adapter=self, session_id=sid)
+                raw_output = tok.decode(turn.output_ids, skip_special_tokens=False) if turn.output_ids else ""
+                parsed = parse_model_output(
+                    raw_output,
+                    tools_schema=tools_schema,
+                    tool_parser_name=self.tool_parser,
+                    reasoning_parser_name=self.reasoning_parser,
+                )
+                reply = self._build_reply(parsed, turn.finish_reason, translated, tools_schema)
+                verdict = self._validate_reply(parsed, s)
+                if verdict is None:
+                    break
+                if attempt == self.tool_call_max_retries:
+                    self.logger.warning(
+                        "[%s] sid=%s tool call still invalid after %d retries: %s",
+                        self.log_prefix,
+                        sid,
+                        self.tool_call_max_retries,
+                        verdict,
+                    )
+                    break
+                self.logger.info(
+                    "[%s] sid=%s invalid tool call %s; regenerating (attempt %d/%d)",
+                    self.log_prefix,
+                    sid,
+                    verdict,
+                    attempt + 1,
+                    self.tool_call_max_retries,
+                )
 
-            raw_output = tok.decode(turn.output_ids, skip_special_tokens=False) if turn.output_ids else ""
-            parsed = parse_model_output(
-                raw_output,
-                tools_schema=tools_schema,
-                tool_parser_name=self.tool_parser,
-                reasoning_parser_name=self.reasoning_parser,
+            turn = dataclasses.replace(
+                turn,
+                ill_formed=parsed.ill_formed,
+                invalid_tool_call=verdict is not None,
             )
-            reply = self._build_reply(parsed, turn.finish_reason, translated, tools_schema)
-            turn = dataclasses.replace(turn, ill_formed=parsed.ill_formed)
 
             in_tok, out_tok = len(prompt_ids), len(turn.output_ids)
             stream = body.get("stream") is True or "text/event-stream" in request.headers.get("Accept", "")

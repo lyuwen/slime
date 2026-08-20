@@ -66,6 +66,20 @@ class OpenAIAdapter(BaseAdapter):
             wire=(wire_message, wire_finish),
         )
 
+    def _validate_reply(self, parsed, session):
+        """Reject a turn whose tool calls fail the configured validator.
+
+        Returns None (accept) when no validator is configured or the session is
+        an eval rollout; otherwise runs the validator over the FULL tool-call
+        list (pre-truncation) in OpenAI response-dict shape.
+        """
+        if self.tool_call_validator is None or session.is_eval:
+            return None
+        if not parsed.tool_uses:
+            return None
+        response_dict = {"choices": [{"message": {"tool_calls": _wire_tool_calls(parsed)}}]}
+        return self.tool_call_validator(response_dict)
+
     async def _respond(self, request, body, reply, in_tok, out_tok, stream, cached_tok: int = 0) -> web.StreamResponse:
         wire_message, wire_finish = reply.wire
         if stream:
