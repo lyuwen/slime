@@ -109,5 +109,16 @@ def test_convert_omits_key_when_absent():
     assert "toolcall_turn_shaping" not in td
 
 
+def test_convert_mixed_batch_fills_absent_with_zeros():
+    """Mixed batch: when ANY sample has the key, samples lacking it get zero-fill."""
+    # sample 0: no metadata; sample 1: has shaping
+    samples = [_sample(0, 3), _sample(1, 2, [0.0, -0.5])]
+    td = _convert(samples)
+    assert "toolcall_turn_shaping" in td
+    assert len(td["toolcall_turn_shaping"]) == 2
+    assert td["toolcall_turn_shaping"][0] == [0.0, 0.0, 0.0]  # zero-fill for sample 0 (response_length=3)
+    assert td["toolcall_turn_shaping"][1] == [0.0, -0.5]
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
