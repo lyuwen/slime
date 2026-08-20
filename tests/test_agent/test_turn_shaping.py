@@ -119,5 +119,31 @@ def test_budget_cap_scales_total():
     assert all(abs(v - nonzero[0]) < 1e-9 for v in nonzero)
 
 
+def test_adapter_forwards_scorer_to_manager():
+    """BaseAdapter passes turn_scorer + scalars into its TrajectoryManager."""
+    from slime.agent.adapters.common import BaseAdapter
+
+    def scorer(node):
+        return 0
+
+    class _Tok:
+        def apply_chat_template(self, *a, **k):
+            return {"input_ids": [1]}
+
+        def decode(self, *a, **k):
+            return ""
+
+    ad = BaseAdapter(
+        tokenizer=_Tok(),
+        sglang_url="http://x",
+        turn_scorer=scorer,
+        shaping_beta=0.25,
+        shaping_budget=2.0,
+    )
+    assert ad.manager._turn_scorer is scorer
+    assert ad.manager._shaping_beta == 0.25
+    assert ad.manager._shaping_budget == 2.0
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

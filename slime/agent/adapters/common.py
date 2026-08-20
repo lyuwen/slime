@@ -151,6 +151,9 @@ class BaseAdapter:
         fork_threshold_tokens: int | None = None,
         chat_template_kwargs: dict | None = None,
         debug_callback: Callable[..., None] | None = None,
+        turn_scorer: Callable[..., int] | None = None,
+        shaping_beta: float = 0.0,
+        shaping_budget: float = 1.0,
     ) -> None:
         self.tokenizer = tokenizer
         self.sglang_url = sglang_url.rstrip("/") if isinstance(sglang_url, str) else sglang_url
@@ -164,9 +167,12 @@ class BaseAdapter:
 
         # one manager shared across all sids; per-sid trees live inside it.
         # fork_threshold_tokens left None means the manager uses its own default.
-        mgr_kwargs: dict[str, int] = {}
+        mgr_kwargs: dict[str, Any] = {}
         if fork_threshold_tokens is not None:
             mgr_kwargs["fork_threshold_tokens"] = fork_threshold_tokens
+        mgr_kwargs["turn_scorer"] = turn_scorer
+        mgr_kwargs["shaping_beta"] = shaping_beta
+        mgr_kwargs["shaping_budget"] = shaping_budget
         self.manager = TrajectoryManager(**mgr_kwargs)
 
         self.debug_callback: Callable[..., None] | None = debug_callback
@@ -181,8 +187,12 @@ class BaseAdapter:
     # -- wire hooks (subclass overrides) -------------------------------------
 
     def _register_routes(self, app: web.Application) -> None:
-        """Register the protocol's POST route(s) and bind self._run_turn."""
-        raise NotImplementedError
+        """Register the protocol's POST route(s) and bind self._run_turn.
+
+        Subclasses override this to add their wire routes; the base is a no-op so
+        BaseAdapter can be constructed directly (e.g. in tests) without a
+        protocol.
+        """
 
     def _session_id(self, request: web.Request, body: dict) -> str:
         raise NotImplementedError
