@@ -119,6 +119,7 @@ ALGO_ARGS=(
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
+   --custom-advantage-function-path examples.coding_agent_rl.turn_shaping.compute_advantage
 )
 
 OPTIMIZER_ARGS=(
@@ -209,6 +210,12 @@ export SWE_EVAL_MAX_ATTEMPTS="${SWE_EVAL_MAX_ATTEMPTS:-3}"
 export SWE_ROLLOUT_RETRIES="${SWE_ROLLOUT_RETRIES:-3}"
 export SWE_ROLLOUT_RETRY_POLICY="${SWE_ROLLOUT_RETRY_POLICY:-pre-launch}"
 export SWE_BOOT_CONCURRENCY="${SWE_BOOT_CONCURRENCY:-16}"
+
+# ============ tool-call reward shaping (off by default) ============
+# beta=0.0 disables the feature entirely (no annotator import). When enabled,
+# toolcall-annotation must be installed on every Ray worker.
+export SWE_TOOLCALL_SHAPING_BETA="${SWE_TOOLCALL_SHAPING_BETA:-0.0}"
+export SWE_TOOLCALL_SHAPING_BUDGET="${SWE_TOOLCALL_SHAPING_BUDGET:-1.0}"
 
 # ============ proxy bypass for in-cluster traffic ============
 export no_proxy="127.0.0.1,${MASTER_ADDR},${ADAPTER_PUBLIC_HOST}"

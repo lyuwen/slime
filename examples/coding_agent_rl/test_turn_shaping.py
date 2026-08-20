@@ -100,5 +100,25 @@ def test_compute_advantage_without_shaping_key():
     assert torch.allclose(rollout_data["advantages"][0], torch.tensor([1.0, 1.0, 1.0]))
 
 
+def test_shaping_config_from_env(monkeypatch):
+    """CONFIG reads beta/budget from SWE_ env vars; scorer built only when beta!=0."""
+
+    # beta == 0 → no scorer
+    monkeypatch.setenv("SWE_TOOLCALL_SHAPING_BETA", "0.0")
+    from examples.coding_agent_rl.generate import resolve_shaping_config
+
+    beta, budget, scorer = resolve_shaping_config()
+    assert beta == 0.0
+    assert scorer is None
+
+    # beta != 0 → scorer built
+    monkeypatch.setenv("SWE_TOOLCALL_SHAPING_BETA", "0.3")
+    monkeypatch.setenv("SWE_TOOLCALL_SHAPING_BUDGET", "2.0")
+    beta, budget, scorer = resolve_shaping_config()
+    assert beta == 0.3
+    assert budget == 2.0
+    assert callable(scorer)
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

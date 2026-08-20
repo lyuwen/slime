@@ -44,6 +44,7 @@ from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
 
 from . import swe
+from .turn_shaping import make_turn_scorer
 
 logger = logging.getLogger(__name__)
 logging.getLogger("e2b").setLevel(logging.WARNING)
@@ -136,6 +137,18 @@ class SweConfig:
 
 
 CONFIG = SweConfig.from_env()
+
+
+def resolve_shaping_config():
+    """Read tool-call shaping knobs from env.
+
+    Returns (beta, budget, scorer). scorer is None when disabled (beta == 0),
+    so the annotator is never imported for runs that don't use shaping.
+    """
+    beta = float(os.environ.get("SWE_TOOLCALL_SHAPING_BETA", "0.0"))
+    budget = float(os.environ.get("SWE_TOOLCALL_SHAPING_BUDGET", "1.0"))
+    scorer = make_turn_scorer() if beta != 0.0 else None
+    return beta, budget, scorer
 
 
 def get_prompt(md: dict) -> str:
@@ -283,6 +296,7 @@ class _AdapterService(metaclass=SingletonMeta):
                 "sandboxes can reach for reverse-connection to the adapter; "
                 "without it the sandbox cannot dial back and the rollout aborts."
             )
+        _beta, _budget, _scorer = resolve_shaping_config()
         self.adapter = ADAPTER_CLS(
             tokenizer=self.tokenizer,
             sglang_url=sglang_url,
@@ -290,6 +304,9 @@ class _AdapterService(metaclass=SingletonMeta):
             reasoning_parser=self.reasoning_parser,
             fork_threshold_tokens=CONFIG.fork_merge_threshold,
             chat_template_kwargs=getattr(args, "apply_chat_template_kwargs", None),
+            turn_scorer=_scorer,
+            shaping_beta=_beta,
+            shaping_budget=_budget,
         )
         # handler_cancellation=True so a client disconnect cancels the handler
         # coroutine, arming the fire-and-forget /abort_request in the adapter.
