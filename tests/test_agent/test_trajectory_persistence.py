@@ -126,7 +126,7 @@ class _FakeSB:
     def __init__(self, payload):
         self._payload = payload
 
-    async def read_file(self, path, *, user="root"):
+    async def read_file(self, path, *, user="root", strict=False):
         return self._payload
 
 

@@ -232,5 +232,53 @@ def test_base_harness_run_calls_steps_in_order():
     asyncio.run(run_case())
 
 
+# ===========================================================================
+# §6 exec_and_wait launcher paths (home directories, not /tmp)
+# ===========================================================================
+
+
+def test_run_agent_launcher_in_agent_home():
+    """Verify launcher/done_file/lock_dir land in /home/agent/tmp/ for user="agent"."""
+
+    async def run_case():
+        async def agent(env):
+            return 0
+
+        sb = FakeSandbox(on_launch=agent)
+        with patch.object(sandbox_mod.asyncio, "sleep", new=_fast_sleep):
+            exit_code, _ = await sandbox_mod.exec_and_wait(
+                sb, cmd="echo test", time_budget_sec=30, tag="run", user="agent"
+            )
+        assert exit_code == 0
+        # launcher, done_file, lock_dir in /home/agent/tmp/, not /tmp
+        launcher = next((k for k in sb.files if k.endswith(".sh") and "run-" in k), None)
+        assert launcher is not None and launcher.startswith("/home/agent/tmp/")
+        done = next((k for k in sb.files if k.endswith(".done")), None)
+        assert done is not None and done.startswith("/home/agent/tmp/")
+        lock = next((c for c, _ in sb.exec_log if ".spawned" in c), None)
+        assert lock is not None and "/home/agent/tmp/" in lock
+
+    asyncio.run(run_case())
+
+
+def test_install_npm_cli_launcher_in_root_home():
+    """Verify launcher lands in /root/tmp/ for user="root"."""
+
+    async def run_case():
+        async def root_task(env):
+            return 0
+
+        sb = FakeSandbox(on_launch=root_task)
+        with patch.object(sandbox_mod.asyncio, "sleep", new=_fast_sleep):
+            exit_code, _ = await sandbox_mod.exec_and_wait(
+                sb, cmd="apt install -y npm", time_budget_sec=30, tag="install", user="root"
+            )
+        assert exit_code == 0
+        launcher = next((k for k in sb.files if k.endswith(".sh") and "install-" in k), None)
+        assert launcher is not None and launcher.startswith("/root/tmp/")
+
+    asyncio.run(run_case())
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

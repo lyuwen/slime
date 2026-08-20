@@ -36,6 +36,11 @@ class TurnRecord:
     finish_reason: str
     output_log_probs: list[float] = dataclasses.field(default_factory=list)
     ill_formed: bool = False
+    # Token-count stats from sglang meta_info (zero when the server does not
+    # report them, e.g. --enable-cache-report off, or on the early-exit path).
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cached_tokens: int = 0
 
 
 # ===========================================================================
@@ -165,6 +170,10 @@ class _SampleBuilder:
         self.logprobs: list[float] = []
         self.last_response_start_idx: int | None = None
         self.leading_prompt_len: int = 0
+        # sglang token-count stats summed across every turn folded into this Sample.
+        self.prompt_tokens: int = 0
+        self.completion_tokens: int = 0
+        self.cached_tokens: int = 0
 
     def classify_token_drift(self, turn: TurnRecord) -> DriftKind:
         """Decide how this builder should absorb ``turn``'s prompt.
@@ -212,6 +221,16 @@ class _SampleBuilder:
 
         if is_first_turn:
             self.leading_prompt_len = len(turn.prompt_ids)
+
+        # Accumulate this turn's sglang stats only when this builder is training
+        # on the response (trained=True), which is true exactly on the first leaf
+        # to claim a shared turn. Later leaves re-emit the same response as
+        # loss_mask=0 context (trained=False) — if we counted their stats too,
+        # shared-prefix calls would be double-counted across forked samples.
+        if trained:
+            self.prompt_tokens += turn.prompt_tokens
+            self.completion_tokens += turn.completion_tokens
+            self.cached_tokens += turn.cached_tokens
 
     def _align_to_prompt(self, prompt_ids: list[int]) -> None:
         """Heal REALIGN drift by overwriting the most-recent response span with
@@ -495,11 +514,16 @@ class TrajectoryManager:
             "use_tool": use_tool,
             "ill_formed": ill_formed,
         }
-        return [
-            builder.to_sample(base_sample, md, max_sample_tokens)
-            for builder in self._split_chain_into_builders(chain)
-            if builder.has_trained_response()
-        ]
+        samples: list[Sample] = []
+        for builder in self._split_chain_into_builders(chain):
+            if not builder.has_trained_response():
+                continue
+            sample = builder.to_sample(base_sample, md, max_sample_tokens)
+            sample.prefix_cache_info.cached_tokens = builder.cached_tokens
+            sample.prefix_cache_info.total_prompt_tokens = builder.prompt_tokens
+            sample.prefix_cache_info.completion_tokens = builder.completion_tokens
+            samples.append(sample)
+        return samples
 
 
 __all__ = [

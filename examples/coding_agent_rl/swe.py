@@ -33,13 +33,14 @@ import asyncio
 import json
 import logging
 import os
+import random
 import tempfile
 from pathlib import Path
 from typing import Any, NamedTuple
 
 from slime.agent import sandbox as agent_sandbox
 from slime.agent.adapters.common import flatten_content
-from slime.agent.sandbox import E2BSandbox, Sandbox, exec_and_wait
+from slime.agent.sandbox import E2BSandbox, Sandbox, exec_and_wait, is_fresh_sandbox_retryable
 from slime.utils.types import Sample
 
 try:
@@ -262,12 +263,90 @@ async def git_diff(sb: Sandbox, workdir: str) -> str:
 # ---------------------------------------------------------------------------
 # Eval dispatch (fresh sandbox, apply diff, run dataset tests)
 # ---------------------------------------------------------------------------
-async def run_evaluation(md: dict, *, diff_text: str, timeout_sec: int) -> EvalResult:
-    """Uniform entry point: dispatch to the protocol's grader.
+async def run_evaluation(
+    md: dict,
+    *,
+    diff_text: str,
+    timeout_sec: int,
+    max_attempts: int = 1,
+) -> EvalResult:
+    """Uniform entry point: dispatch to the protocol's grader with bounded
+    fresh-sandbox retry.
 
-    No-test-cheating guarantee (both grading protocols): the eval sandbox is built from
-    the same image but starts CLEAN, so only the model-produced diff affects
-    reward."""
+    Each attempt calls ``_run_evaluation_once()`` which selects the protocol
+    grader. The grader owns ``async with E2BSandbox(image) as ev``; exiting
+    that context on failure kills or releases the broken sandbox before the
+    next attempt boots a fresh one.
+
+    Only infrastructure exceptions (transport errors, sandbox unavailable)
+    trigger a retry. A returned ``EvalResult`` — including reward=0.0 or
+    applied_cleanly=False — is never retried.
+
+    ``max_attempts=1`` disables fresh-sandbox evaluation retry (a single
+    evaluation attempt). Note this is not identical to pre-retry behaviour:
+    grader commands are now issued non-idempotently, so they are no longer
+    transparently re-run in the same sandbox after an ambiguous stream break.
+    """
+    instance_id = md.get("instance_id", "?")
+    protocol = md.get("protocol", "?")
+    last_err: BaseException | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = await _run_evaluation_once(md, diff_text, timeout_sec)
+            if attempt > 1:
+                logger.info(
+                    "[swe] %s [%s]: eval succeeded on attempt %d/%d reward=%.2f",
+                    instance_id,
+                    protocol,
+                    attempt,
+                    max_attempts,
+                    float(result.reward),
+                )
+            return result
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            raise  # never swallow cancellation or the outer wall-clock guard
+        except BaseException as e:
+            if not is_fresh_sandbox_retryable(e):
+                raise  # deterministic error — propagate immediately
+            last_err = e
+            if attempt < max_attempts:
+                # Half-jitter exponential backoff: floor grows with ceiling so
+                # every retry waits at least ceil/2 seconds, ensuring the delay
+                # increases meaningfully with each attempt rather than allowing
+                # near-zero draws on later attempts (full-jitter anti-pattern).
+                # Base 5 s gives: attempt 1 → [2.5, 5], 2 → [5, 10], 3 → [10, 20]
+                ceiling = min(30.0, 5.0 * (2 ** (attempt - 1)))
+                delay = random.uniform(ceiling / 2, ceiling)
+                logger.warning(
+                    "[swe] %s [%s]: eval attempt %d/%d failed (%s: %s); "
+                    "backoff=%.1fs, next attempt uses a fresh evaluator sandbox",
+                    instance_id,
+                    protocol,
+                    attempt,
+                    max_attempts,
+                    type(e).__name__,
+                    str(e)[:120],
+                    delay,
+                )
+                await asyncio.sleep(delay)
+            else:
+                logger.warning(
+                    "[swe] %s [%s]: eval exhausted %d/%d attempts (%s: %s); re-raising",
+                    instance_id,
+                    protocol,
+                    attempt,
+                    max_attempts,
+                    type(e).__name__,
+                    str(e)[:120],
+                )
+    assert last_err is not None
+    raise last_err
+
+
+async def _run_evaluation_once(md: dict, diff_text: str, timeout_sec: int) -> EvalResult:
+    """Single-attempt protocol dispatch. Each grader owns its evaluator sandbox
+    context; a failure exits that context (killing the sandbox) before returning
+    to the caller."""
     if md.get("protocol") == PROTOCOL_SWEBENCH:
         return await _grade_swebench(md, diff_text, timeout_sec)
     return await _grade_scaleswe(md, diff_text, timeout_sec)
@@ -349,6 +428,7 @@ async def _run_swepro(ev: Sandbox, workdir: str, swepro: dict, timeout: int) -> 
         user="agent",
         check=False,
         timeout=timeout,
+        idempotent=False,
     )
     await ev.exec(
         f"python3 {_SWEPRO_DIR}/parser.py {stdout_f} {stderr_f} {result_f}",
@@ -356,7 +436,7 @@ async def _run_swepro(ev: Sandbox, workdir: str, swepro: dict, timeout: int) -> 
         check=False,
         timeout=120,
     )
-    raw = await ev.read_file(result_f, user="agent")
+    raw = await ev.read_file(result_f, user="agent", strict=True)
     parsed = json.loads(raw) if raw else {"tests": []}
     passed = {t["name"] for t in parsed.get("tests", []) if t.get("status") == "PASSED"}
     required = set(swepro.get("fail_to_pass") or []) | set(swepro.get("pass_to_pass") or [])
@@ -365,7 +445,7 @@ async def _run_swepro(ev: Sandbox, workdir: str, swepro: dict, timeout: int) -> 
 
 
 async def _run_eval_cmd(ev: Sandbox, workdir: str, cmd: str, timeout: int) -> float:
-    ec, _, _ = await ev.exec(f"cd {workdir} && {cmd}", user="agent", check=False, timeout=timeout)
+    ec, _, _ = await ev.exec(f"cd {workdir} && {cmd}", user="agent", check=False, timeout=timeout, idempotent=False)
     return 1.0 if ec == 0 else 0.0
 
 
@@ -374,7 +454,9 @@ async def _run_f2p_script(ev: Sandbox, workdir: str, script: str, timeout: int) 
     # `sys.exit(pytest.main([...]))`; write it verbatim (no shell quoting) and
     # let python's exit code carry the pass/fail signal.
     await ev.write_file(_F2P, script, user="agent")
-    ec, _, _ = await ev.exec(f"cd {workdir} && python {_F2P}", user="agent", check=False, timeout=timeout)
+    ec, _, _ = await ev.exec(
+        f"cd {workdir} && python {_F2P}", user="agent", check=False, timeout=timeout, idempotent=False
+    )
     return 1.0 if ec == 0 else 0.0
 
 
@@ -499,7 +581,13 @@ async def _grade_swebench(md: dict, diff_text: str, timeout_sec: int) -> EvalRes
             logger.warning("[swe.swebench] %s: model patch failed to apply; reward=0", instance_id)
             return EvalResult(0.0, False)
         exit_code, log = await exec_and_wait(
-            ev, cmd="bash /tmp/eval.sh", user="root", time_budget_sec=timeout_sec, tag="eval", want_output=True
+            ev,
+            cmd="bash /tmp/eval.sh",
+            user="root",
+            time_budget_sec=timeout_sec,
+            tag="eval",
+            want_output=True,
+            strict_output=True,
         )
 
     try:

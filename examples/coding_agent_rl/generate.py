@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import secrets
@@ -37,7 +38,7 @@ from jinja2 import Environment, FileSystemLoader, TemplateError
 from slime.agent.adapters import AnthropicAdapter, OpenAIAdapter
 from slime.agent.aiohttp_threaded import FilteredAccessLogger, run_app_in_thread
 from slime.agent.harness import ClaudeCodeHarness, CodexHarness, OpenHandsHarness
-from slime.agent.sandbox import E2BSandbox
+from slime.agent.sandbox import E2BSandbox, is_fresh_sandbox_retryable
 from slime.utils.misc import SingletonMeta
 from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
@@ -68,9 +69,13 @@ class SweConfig:
     fork_merge_threshold: int | None
     agent_time_budget_sec: int
     eval_timeout_sec: int
+    eval_max_attempts: int  # NEW — SWE_EVAL_MAX_ATTEMPTS
     rollout_guard_sec: int
     boot_concurrency: int
     boot_retries: int
+    rollout_retries: int
+    retry_policy: str
+    retry_min_budget_sec: float
     oh_fake_user: bool
     oh_max_iterations: int
     oh_tools: list[str]
@@ -80,7 +85,13 @@ class SweConfig:
     def from_env(cls) -> SweConfig:
         agent_time_budget = int(os.environ.get("SWE_AGENT_TIME_BUDGET_SEC", "1800"))
         eval_timeout = int(os.environ.get("SWE_EVAL_TIMEOUT_SEC", "600"))
-        guard = int(os.environ.get("SWE_ROLLOUT_GUARD_SEC", "0") or 0) or (agent_time_budget + eval_timeout + 180)
+        _raw_max_attempts = int(os.environ.get("SWE_EVAL_MAX_ATTEMPTS", "2"))
+        if _raw_max_attempts < 1:
+            raise ValueError(f"SWE_EVAL_MAX_ATTEMPTS must be >= 1, got {_raw_max_attempts!r}")
+        eval_max_attempts = _raw_max_attempts
+        guard = int(os.environ.get("SWE_ROLLOUT_GUARD_SEC", "0") or 0) or (
+            agent_time_budget + eval_timeout * eval_max_attempts + 180
+        )
         fork = int(v) if (v := os.environ.get("SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS")) else None
         oh_tools_raw = os.environ.get("SWE_OH_TOOLS", "file_editor,terminal,task_tracker,think,finish")
         oh_tools = [t.strip() for t in oh_tools_raw.split(",") if t.strip()]
@@ -88,6 +99,19 @@ class SweConfig:
         oh_extra_envs = json.loads(oh_extra_envs_raw) if oh_extra_envs_raw else {}
         if not isinstance(oh_extra_envs, dict):
             raise ValueError("SLIME_AGENT_OH_EXTRA_ENVS must be a JSON object")
+        rollout_retries = int(os.environ.get("SWE_ROLLOUT_RETRIES", "2"))
+        if rollout_retries < 0:
+            raise ValueError("SWE_ROLLOUT_RETRIES must be non-negative")
+        retry_policy = os.environ.get("SWE_ROLLOUT_RETRY_POLICY", "pre-launch")
+        if retry_policy not in ("pre-launch", "retry-from-scratch", "always-fail"):
+            raise ValueError(
+                f"SWE_ROLLOUT_RETRY_POLICY={retry_policy!r} invalid; "
+                f"must be pre-launch|retry-from-scratch|always-fail"
+            )
+        _min_budget_env = os.environ.get("SWE_AGENT_RETRY_MIN_BUDGET_SEC")
+        retry_min_budget_sec = float(_min_budget_env) if _min_budget_env else 0.5 * agent_time_budget
+        if not math.isfinite(retry_min_budget_sec) or retry_min_budget_sec < 0:
+            raise ValueError("SWE_AGENT_RETRY_MIN_BUDGET_SEC must be a finite value >= 0")
         return cls(
             eval_protocol=os.environ.get("SWE_EVAL_PROTOCOL", swe.PROTOCOL_SCALESWE),
             train_protocol=os.environ.get("SWE_TRAIN_PROTOCOL", swe.PROTOCOL_SCALESWE),
@@ -97,9 +121,13 @@ class SweConfig:
             fork_merge_threshold=fork,
             agent_time_budget_sec=agent_time_budget,
             eval_timeout_sec=eval_timeout,
+            eval_max_attempts=eval_max_attempts,
             rollout_guard_sec=guard,
             boot_concurrency=int(os.environ.get("SWE_BOOT_CONCURRENCY", "16")),
             boot_retries=int(os.environ.get("SWE_BOOT_RETRIES", "2")),
+            rollout_retries=rollout_retries,
+            retry_policy=retry_policy,
+            retry_min_budget_sec=retry_min_budget_sec,
             oh_fake_user=os.environ.get("SWE_OH_FAKE_USER", "0") not in ("0", "", "false", "False"),
             oh_max_iterations=int(os.environ.get("SWE_OH_MAX_ITERATIONS", "100")),
             oh_tools=oh_tools,
@@ -220,6 +248,10 @@ async def boot_agent_sandbox(image: str, instance_id: str) -> AsyncIterator[E2BS
             break
         except Exception as e:
             last_err = e
+            # always-fail policy fails any exception immediately (README/design):
+            # do not consume the internal boot_retries budget under this policy.
+            if CONFIG.retry_policy == "always-fail":
+                raise
             logger.warning(
                 "[coding_agent_rl] %s: provision attempt %d/%d failed: %s: %s",
                 instance_id,
@@ -284,8 +316,48 @@ class _AdapterService(metaclass=SingletonMeta):
         )
 
 
+def _is_retryable(e: Exception) -> bool:
+    """Determine if an exception represents a transient failure worth retrying.
+
+    Retryable errors include E2B RPC failures, workspace setup issues, and
+    certain network/sandbox errors. Non-retryable errors include dataset
+    issues, adapter problems, and application logic failures.
+    """
+    # Kernel classifier is the single source of truth for generic
+    # SandboxException / E2B transport errors. Consult it first.
+    if is_fresh_sandbox_retryable(e):
+        return True
+    # For a SandboxException the kernel classifier is authoritative in BOTH
+    # directions: it already returns True for transient provider errors and
+    # False for the permanent auth/quota/billing denylist. Do not let the
+    # message heuristics below (e.g. "create") resurrect a rejected one.
+    if type(e).__name__ == "SandboxException":
+        return False
+
+    msg = str(e).lower()
+    exc_type = type(e).__name__.lower()
+
+    # E2B exec failures (especially exit=255) are often transient
+    if "e2b exec failed" in msg or "exit=255" in msg or "exit 255" in msg:
+        return True
+
+    # General sandbox/RPC errors
+    if "runtimeerror" in exc_type and ("sandbox" in msg or "exec" in msg or "e2b" in msg):
+        return True
+
+    # Connection/network issues (but not asyncio.TimeoutError — that's the wall-clock guard)
+    if any(x in msg for x in ["connection", "timeout", "network", "unavailable"]) and "asyncio" not in exc_type:
+        return True
+
+    # Sandbox boot failures
+    if "boot" in msg or "create" in msg:
+        return True
+
+    return False
+
+
 async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], evaluation: bool = False):
-    """Per-sample agent function with wall-clock guard (see rollout_guard_sec)."""
+    """Per-sample agent function with wall-clock guard and setup retries."""
     state = _AdapterService(args)
     protocol = CONFIG.eval_protocol if evaluation else CONFIG.train_protocol
     md = swe.get_metadata(base_sample, protocol)
@@ -296,45 +368,89 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     if reason:
         return _abort_result(base_sample, f"unevaluatable:{reason}", instance_id)
 
-    session_id = base_sample.session_id = _session_id(base_sample, instance_id)
-    state.adapter.open_session(
-        session_id,
-        sampling_defaults=sampling_params,
-        max_context_tokens=state.max_context_len,
-    )
+    base_session_id = _session_id(base_sample, instance_id)
+    session_id = base_session_id
+    session_open = False
     t0 = time.time()
     traj_data = None
+
     try:
         async with asyncio.timeout(CONFIG.rollout_guard_sec):
-            async with boot_agent_sandbox(md["image"], instance_id) as sb:
-                await swe.prepare_workspace(sb, md["workdir"], md)
-                oh_kwargs = (
-                    {
-                        "fake_user": CONFIG.oh_fake_user,
-                        "max_iterations": CONFIG.oh_max_iterations,
-                        "tools": CONFIG.oh_tools,
-                        "extra_envs": CONFIG.oh_extra_envs,
-                    }
-                    if AGENT_NAME == "openhands"
-                    else {}
-                )
-                agent_exit_code = await HARNESS_CLS().run(
-                    sb,
-                    workdir=md["workdir"],
-                    session_id=session_id,
-                    adapter_url=state.adapter_url,
-                    time_budget_sec=CONFIG.agent_time_budget_sec,
-                    prompt=get_prompt(md),
-                    **oh_kwargs,
-                )
-                diff_text = await swe.git_diff(sb, md["workdir"])
-                if AGENT_NAME == "openhands":
-                    traj_data = await _read_sandbox_trajectory(sb, OpenHandsHarness.trajectory_sandbox_path)
+            for attempt in range(CONFIG.rollout_retries + 1):
+                session_id = f"{base_session_id}-a{attempt}"
+                session_open = False
+                try:
+                    async with boot_agent_sandbox(md["image"], instance_id) as sb:
+                        await swe.prepare_workspace(sb, md["workdir"], md)
+                        state.adapter.open_session(
+                            session_id,
+                            sampling_defaults=sampling_params,
+                            max_context_tokens=state.max_context_len,
+                        )
+                        session_open = True
+                        oh_kwargs = (
+                            {
+                                "fake_user": CONFIG.oh_fake_user,
+                                "max_iterations": CONFIG.oh_max_iterations,
+                                "tools": CONFIG.oh_tools,
+                                "extra_envs": CONFIG.oh_extra_envs,
+                            }
+                            if AGENT_NAME == "openhands"
+                            else {}
+                        )
+                        agent_exit_code = await HARNESS_CLS().run(
+                            sb,
+                            workdir=md["workdir"],
+                            session_id=session_id,
+                            adapter_url=state.adapter_url,
+                            time_budget_sec=CONFIG.agent_time_budget_sec,
+                            prompt=get_prompt(md),
+                            **oh_kwargs,
+                        )
+                        diff_text = await swe.git_diff(sb, md["workdir"])
+                        if AGENT_NAME == "openhands":
+                            traj_data = await _read_sandbox_trajectory(sb, OpenHandsHarness.trajectory_sandbox_path)
+                    # Only the winning sid is used downstream (finish_session/eval).
+                    base_sample.session_id = session_id
+                    break
+                except Exception as error:
+                    if CONFIG.retry_policy == "always-fail":
+                        raise
+                    turns_recorded = state.adapter.manager.has_session(session_id)
+                    if not _is_retryable(error) or attempt >= CONFIG.rollout_retries:
+                        raise
+                    remaining = CONFIG.agent_time_budget_sec - (time.time() - t0)
+                    if remaining < CONFIG.retry_min_budget_sec:
+                        logger.warning(
+                            "[coding_agent_rl] %s: %.0fs agent budget remaining < "
+                            "retry_min_budget %.0fs; not retrying",
+                            instance_id,
+                            remaining,
+                            CONFIG.retry_min_budget_sec,
+                        )
+                        raise
+                    if CONFIG.retry_policy == "pre-launch" and turns_recorded:
+                        raise
+                    # retry permitted
+                    if session_open:
+                        await state.adapter.drop_session(session_id, wait_timeout=30)
+                        session_open = False
+                    backoff = 2**attempt
+                    logger.warning(
+                        "[coding_agent_rl] %s: setup attempt %d/%d failed: %s, retrying in %ds...",
+                        instance_id,
+                        attempt + 1,
+                        CONFIG.rollout_retries + 1,
+                        error,
+                        backoff,
+                    )
+                    await asyncio.sleep(backoff)
 
             reward, applied_cleanly = await swe.run_evaluation(
                 md,
                 diff_text=diff_text,
                 timeout_sec=CONFIG.eval_timeout_sec,
+                max_attempts=CONFIG.eval_max_attempts,
             )
             if traj_data is not None:
                 _persist_trajectory(
@@ -342,6 +458,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     base_sample,
                     messages=traj_data["messages"],
                     tools=traj_data["tools"],
+                    metrics=traj_data.get("metrics"),
                     diff_text=diff_text,
                     reward=float(reward),
                     applied_cleanly=bool(applied_cleanly),
@@ -378,8 +495,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             if not samples:
                 return _abort_result(base_sample, "adapter_session_empty", instance_id)
 
-            for s in samples:
-                s.metadata = {**(s.metadata or {}), "agent_exit_code": agent_exit_code}
+            for sample in samples:
+                sample.metadata = {**(sample.metadata or {}), "agent_exit_code": agent_exit_code}
             if agent_exit_code != 0:
                 reason = "time budget exceeded" if agent_exit_code < 0 else f"CLI error (exit {agent_exit_code})"
                 logger.warning(
@@ -402,17 +519,18 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     except asyncio.TimeoutError:
         _log_timeout_diagnostic(t0, instance_id)
         return _abort_result(base_sample, "wall_clock_timeout", instance_id)
-    except Exception as e:
+    except Exception as error:
         logger.warning(
             "[coding_agent_rl] %s: rollout failed: %s\n%s",
             instance_id,
-            e,
+            error,
             traceback.format_exc(),
         )
-        return _abort_result(base_sample, f"exception:{type(e).__name__}", instance_id)
+        return _abort_result(base_sample, f"exception:{type(error).__name__}", instance_id)
     finally:
-        await state.adapter.drop_session(session_id, wait_timeout=30)  # cleanup only, idempotent
-        await asyncio.sleep(10)
+        if session_open:
+            await state.adapter.drop_session(session_id, wait_timeout=30)  # cleanup only, idempotent
+            await asyncio.sleep(10)
 
 
 def _log_timeout_diagnostic(t0: float, instance_id: str) -> None:
@@ -508,6 +626,7 @@ def _persist_trajectory(
     instance_id: str,
     session_id: str,
     agent_exit_code: int | None,
+    metrics: dict | None = None,
 ) -> None:
     """Best-effort atomic write of the enriched trajectory document."""
     try:
@@ -526,6 +645,8 @@ def _persist_trajectory(
             "session_id": session_id,
             "agent_exit_code": agent_exit_code,
         }
+        if metrics is not None:
+            doc["metrics"] = metrics
         fd, tmp = tempfile.mkstemp(dir=directory, prefix=".traj_", suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as file:

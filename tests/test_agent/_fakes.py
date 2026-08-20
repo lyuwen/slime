@@ -148,9 +148,16 @@ class FakeSGLangServer:
     Use as an async context manager; ``.url`` is the base url to hand the adapter.
     """
 
-    def __init__(self, turns: list[list[tuple[float, int]]], *, finish_reason: str = "stop") -> None:
+    def __init__(
+        self,
+        turns: list[list[tuple[float, int]]],
+        *,
+        finish_reason: str = "stop",
+        cached_tokens_per_turn: list[int] | None = None,
+    ) -> None:
         self.turns = [list(t) for t in turns]
         self.finish_reason = finish_reason
+        self.cached_tokens_per_turn: list[int] = list(cached_tokens_per_turn or [])
         self.requests: list[dict] = []
         self.routing_keys: list[str | None] = []
         self._server: web.Application | None = None
@@ -161,14 +168,14 @@ class FakeSGLangServer:
         self.requests.append(await request.json())
         assert self.turns, "unexpected /generate call (turn script exhausted)"
         pairs = self.turns.pop(0)
-        return web.json_response(
-            {
-                "meta_info": {
-                    "output_token_logprobs": [[lp, tid] for lp, tid in pairs],
-                    "finish_reason": {"type": self.finish_reason},
-                }
-            }
-        )
+        cached = self.cached_tokens_per_turn.pop(0) if self.cached_tokens_per_turn else 0
+        meta: dict = {
+            "output_token_logprobs": [[lp, tid] for lp, tid in pairs],
+            "finish_reason": {"type": self.finish_reason},
+        }
+        if cached:
+            meta["cached_tokens"] = cached
+        return web.json_response({"meta_info": meta})
 
     async def __aenter__(self) -> FakeSGLangServer:
         from aiohttp.test_utils import TestServer
@@ -292,7 +299,7 @@ class FakeSandbox:
     async def write_file(self, sandbox_path, content, *, user="root") -> None:
         self.files[sandbox_path] = content
 
-    async def read_file(self, sandbox_path, *, user="root") -> str:
+    async def read_file(self, sandbox_path, *, user="root", strict=False) -> str:
         return _as_str(self.files.get(sandbox_path, ""))
 
 

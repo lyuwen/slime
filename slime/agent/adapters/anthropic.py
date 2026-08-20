@@ -68,11 +68,11 @@ class AnthropicAdapter(BaseAdapter):
             wire=(blocks, stop_reason),
         )
 
-    async def _respond(self, request, body, reply, in_tok, out_tok, stream) -> web.StreamResponse:
+    async def _respond(self, request, body, reply, in_tok, out_tok, stream, cached_tok: int = 0) -> web.StreamResponse:
         blocks, stop_reason = reply.wire
         if stream:
-            return await _render_stream(request, blocks, stop_reason, in_tok, out_tok)
-        return web.json_response(_render_response(body, blocks, stop_reason, in_tok, out_tok))
+            return await _render_stream(request, blocks, stop_reason, in_tok, out_tok, cached_tok)
+        return web.json_response(_render_response(body, blocks, stop_reason, in_tok, out_tok, cached_tok))
 
 
 # --- Translation (Anthropic wire -> chat-template messages) ---
@@ -195,7 +195,12 @@ def _request_session_id(request: web.Request) -> str:
     return sid_from_bearer(request) or (request.headers.get("X-Api-Key") or "").strip() or "default"
 
 
-def _render_response(body: dict, blocks: list[dict], stop_reason: str, in_tok: int, out_tok: int) -> dict:
+def _render_response(
+    body: dict, blocks: list[dict], stop_reason: str, in_tok: int, out_tok: int, cached_tok: int = 0
+) -> dict:
+    usage: dict[str, int] = {"input_tokens": in_tok, "output_tokens": out_tok}
+    if cached_tok > 0:  # only set when sglang runs with --enable-cache-report
+        usage["cache_read_input_tokens"] = cached_tok
     return {
         "id": f"msg_{secrets.token_hex(12)}",
         "type": "message",
@@ -204,11 +209,11 @@ def _render_response(body: dict, blocks: list[dict], stop_reason: str, in_tok: i
         "content": blocks,
         "stop_reason": stop_reason,
         "stop_sequence": None,
-        "usage": {"input_tokens": in_tok, "output_tokens": out_tok},
+        "usage": usage,
     }
 
 
-async def _render_stream(request, blocks, stop_reason, in_tok, out_tok) -> web.StreamResponse:
+async def _render_stream(request, blocks, stop_reason, in_tok, out_tok, cached_tok: int = 0) -> web.StreamResponse:
     """Stream blocks back as an Anthropic Messages SSE response: message_start,
     (content_block_start, content_block_delta, content_block_stop)*N,
     message_delta, message_stop."""
@@ -222,6 +227,9 @@ async def _render_stream(request, blocks, stop_reason, in_tok, out_tok) -> web.S
     )
     await out.prepare(request)
 
+    ms_usage: dict[str, int] = {"input_tokens": in_tok, "output_tokens": 0}
+    if cached_tok > 0:  # only set when sglang runs with --enable-cache-report
+        ms_usage["cache_read_input_tokens"] = cached_tok
     ms_data = {
         "type": "message_start",
         "message": {
@@ -232,7 +240,7 @@ async def _render_stream(request, blocks, stop_reason, in_tok, out_tok) -> web.S
             "content": [],
             "stop_reason": None,
             "stop_sequence": None,
-            "usage": {"input_tokens": in_tok, "output_tokens": 0},
+            "usage": ms_usage,
         },
     }
     await out.write(f"event: message_start\ndata: {json.dumps(ms_data, ensure_ascii=False)}\n\n".encode())

@@ -19,6 +19,27 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import types  # noqa: E402
+
+# test_sweconfig_parses_openhands_knobs imports examples.coding_agent_rl.generate,
+# which pulls in transformers via slime.utils.processing_utils and uses
+# asyncio.timeout() (3.11+). Stub/shim both so the import resolves on the CPU-only
+# CI env (mirrors tests/test_agent/test_eval_sandbox_retry.py).
+if "transformers" not in sys.modules:
+    _tf_stub = types.ModuleType("transformers")
+    for _name in ("AutoProcessor", "AutoTokenizer", "PreTrainedTokenizerBase", "ProcessorMixin"):
+        setattr(_tf_stub, _name, type(_name, (), {}))
+    sys.modules["transformers"] = _tf_stub
+
+if not hasattr(asyncio, "timeout"):
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def _timeout_shim(_delay):
+        yield
+
+    asyncio.timeout = _timeout_shim
+
 from tests.test_agent._fakes import FakeSandbox  # noqa: E402
 
 from slime.agent.harness import HarnessContext  # noqa: E402
