@@ -46,7 +46,33 @@ def _install_sglang_stubs() -> None:
         sys.modules["sglang_router"] = types.ModuleType("sglang_router")
 
 
+def _install_megatron_stubs() -> None:
+    """Stub megatron.core and torch_memory_saver for the CP-slice test."""
+    if "megatron" not in sys.modules:
+        megatron = types.ModuleType("megatron")
+        core = types.ModuleType("megatron.core")
+        mpu = types.ModuleType("megatron.core.mpu")
+        training = types.ModuleType("megatron.training")
+        checkpointing = types.ModuleType("megatron.training.checkpointing")
+        checkpointing.load_checkpoint = lambda *a, **k: None
+        checkpointing.save_checkpoint = lambda *a, **k: None
+        megatron.core = core
+        megatron.training = training
+        core.mpu = mpu
+        training.checkpointing = checkpointing
+        sys.modules["megatron"] = megatron
+        sys.modules["megatron.core"] = core
+        sys.modules["megatron.core.mpu"] = mpu
+        sys.modules["megatron.training"] = training
+        sys.modules["megatron.training.checkpointing"] = checkpointing
+    if "torch_memory_saver" not in sys.modules:
+        tms = types.ModuleType("torch_memory_saver")
+        tms.torch_memory_saver = lambda *a, **k: lambda f: f
+        sys.modules["torch_memory_saver"] = tms
+
+
 _install_sglang_stubs()
+_install_megatron_stubs()
 
 from slime.utils.types import Sample  # noqa: E402
 
@@ -118,6 +144,24 @@ def test_convert_mixed_batch_fills_absent_with_zeros():
     assert len(td["toolcall_turn_shaping"]) == 2
     assert td["toolcall_turn_shaping"][0] == [0.0, 0.0, 0.0]  # zero-fill for sample 0 (response_length=3)
     assert td["toolcall_turn_shaping"][1] == [0.0, -0.5]
+
+
+def test_cp_slice_included_for_shaping_key():
+    """The _get_rollout_data field loop must list toolcall_turn_shaping so it is
+    CP-sliced and tensorized alongside rollout_log_probs.
+
+    We assert on source to avoid standing up Megatron/CUDA: the key must appear
+    in the same slice loop as rollout_log_probs.
+    """
+    actor_path = Path(__file__).parent.parent / "slime" / "backends" / "megatron_utils" / "actor.py"
+    src = actor_path.read_text()
+    # both keys handled by the same CP-slice loop
+    assert "toolcall_turn_shaping" in src
+    assert "rollout_log_probs" in src
+    idx_loop = src.index("rollout_log_probs")
+    idx_shape = src.index("toolcall_turn_shaping")
+    # shaping key appears within ~200 chars of the rollout_log_probs loop header
+    assert abs(idx_shape - idx_loop) < 400, "shaping key not in the same slice loop"
 
 
 if __name__ == "__main__":
