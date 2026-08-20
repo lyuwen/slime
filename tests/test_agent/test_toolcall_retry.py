@@ -249,5 +249,15 @@ def test_disabled_when_no_validator(monkeypatch):
     asyncio.run(run_case())
 
 
+def test_generate_example_wires_validator_and_eval_flag():
+    gen_src = (REPO_ROOT / "examples" / "coding_agent_rl" / "generate.py").read_text()
+    # validator loaded from the arg and passed to the adapter
+    assert "tool_call_validator_path" in gen_src
+    assert "tool_call_validator=" in gen_src
+    assert "tool_call_max_retries=" in gen_src
+    # eval flag threaded into the session
+    assert "is_eval=evaluation" in gen_src
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
