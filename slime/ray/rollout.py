@@ -789,6 +789,10 @@ class RolloutManager:
         if samples[0].rollout_log_probs is not None:
             train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
 
+        # Add per-token toolcall-correctness shaping when present (feature off by default)
+        if samples[0].metadata and "toolcall_turn_shaping" in samples[0].metadata:
+            train_data["toolcall_turn_shaping"] = [sample.metadata["toolcall_turn_shaping"] for sample in samples]
+
         if getattr(self.args, "rollout_top_p", 1.0) != 1.0:
             for sample in samples:
                 assert sample.rollout_top_p_token_ids is not None
@@ -866,6 +870,7 @@ class RolloutManager:
                 "rollout_ids",
                 "rollout_mask_sums",
                 "rollout_log_probs",
+                "toolcall_turn_shaping",
                 "rollout_top_p_token_ids",
                 "rollout_top_p_token_offsets",
                 "rollout_routed_experts",
