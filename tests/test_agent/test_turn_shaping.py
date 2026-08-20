@@ -133,7 +133,11 @@ def test_adapter_forwards_scorer_to_manager():
         def decode(self, *a, **k):
             return ""
 
-    ad = BaseAdapter(
+    class _RoutelessAdapter(BaseAdapter):
+        def _register_routes(self, app):
+            pass
+
+    ad = _RoutelessAdapter(
         tokenizer=_Tok(),
         sglang_url="http://x",
         turn_scorer=scorer,

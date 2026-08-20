@@ -187,12 +187,8 @@ class BaseAdapter:
     # -- wire hooks (subclass overrides) -------------------------------------
 
     def _register_routes(self, app: web.Application) -> None:
-        """Register the protocol's POST route(s) and bind self._run_turn.
-
-        Subclasses override this to add their wire routes; the base is a no-op so
-        BaseAdapter can be constructed directly (e.g. in tests) without a
-        protocol.
-        """
+        """Register the protocol's POST route(s) and bind self._run_turn."""
+        raise NotImplementedError
 
     def _session_id(self, request: web.Request, body: dict) -> str:
         raise NotImplementedError
