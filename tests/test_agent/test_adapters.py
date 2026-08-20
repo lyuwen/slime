@@ -419,7 +419,150 @@ def test_mid_list_system_folds_into_user():
 
 
 # ===========================================================================
-# §7 parsing helpers (slime.agent.parsing)
+# §8 cache token pass-through (sglang --enable-cache-report)
+# ===========================================================================
+
+
+def test_anthropic_nonstream_reports_cache_read_tokens():
+    async def run_case():
+        async with FakeSGLangServer([[(-0.1, 601)]], cached_tokens_per_turn=[42]) as sglang:
+            tok = FakeTokenizer(outputs={(601,): "cached reply"})
+            adapter = anthropic.AnthropicAdapter(tokenizer=tok, sglang_url=sglang.url)
+            adapter.open_session("sid-ac")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                resp = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-ac"},
+                    json={"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}]},
+                )
+                data = await resp.json()
+            finally:
+                await client.close()
+            await _drain(adapter, "sid-ac")
+
+        assert resp.status == 200
+        assert data["usage"]["cache_read_input_tokens"] == 42
+        # standard fields still present
+        assert "input_tokens" in data["usage"]
+        assert "output_tokens" in data["usage"]
+
+    asyncio.run(run_case())
+
+
+def test_anthropic_stream_reports_cache_read_tokens_in_message_start():
+    async def run_case():
+        async with FakeSGLangServer([[(-0.1, 602)]], cached_tokens_per_turn=[17]) as sglang:
+            tok = FakeTokenizer(outputs={(602,): "streamed cached"})
+            adapter = anthropic.AnthropicAdapter(tokenizer=tok, sglang_url=sglang.url)
+            adapter.open_session("sid-acs")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                resp = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-acs", "Accept": "text/event-stream"},
+                    json={
+                        "model": "m",
+                        "stream": True,
+                        "max_tokens": 4,
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+                raw = await resp.text()
+            finally:
+                await client.close()
+            await _drain(adapter, "sid-acs")
+
+        events = _parse_sse(raw)
+        start_payload = next(p for n, p in events if n == "message_start")
+        assert start_payload["message"]["usage"]["cache_read_input_tokens"] == 17
+
+    asyncio.run(run_case())
+
+
+def test_openai_nonstream_reports_cached_tokens_in_usage_details():
+    async def run_case():
+        async with FakeSGLangServer([[(-0.3, 603)]], cached_tokens_per_turn=[99]) as sglang:
+            tok = FakeTokenizer(outputs={(603,): "cached oai"})
+            adapter = openai.OpenAIAdapter(tokenizer=tok, sglang_url=sglang.url)
+            adapter.open_session("sid-oc")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer sid-oc"},
+                    json={"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}]},
+                )
+                data = await resp.json()
+            finally:
+                await client.close()
+            await _drain(adapter, "sid-oc")
+
+        assert resp.status == 200
+        assert data["usage"]["prompt_tokens_details"]["cached_tokens"] == 99
+        assert "prompt_tokens" in data["usage"]
+
+    asyncio.run(run_case())
+
+
+def test_openai_stream_reports_cached_tokens_in_final_chunk():
+    async def run_case():
+        async with FakeSGLangServer([[(-0.1, 604)]], cached_tokens_per_turn=[55]) as sglang:
+            tok = FakeTokenizer(outputs={(604,): "streamed oai cached"})
+            adapter = openai.OpenAIAdapter(tokenizer=tok, sglang_url=sglang.url)
+            adapter.open_session("sid-ocs")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer sid-ocs"},
+                    json={"model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+                )
+                raw = await resp.text()
+            finally:
+                await client.close()
+            await _drain(adapter, "sid-ocs")
+
+        events = _parse_sse(raw)
+        # the final data chunk (before [DONE]) carries the usage summary
+        usage_chunks = [p for _, p in events if isinstance(p, dict) and p.get("usage")]
+        assert usage_chunks, "no chunk with usage found"
+        assert usage_chunks[-1]["usage"]["prompt_tokens_details"]["cached_tokens"] == 55
+
+    asyncio.run(run_case())
+
+
+def test_no_cache_field_when_cached_tokens_zero():
+    """When sglang does not report cached_tokens, the wire response is unchanged."""
+
+    async def run_case():
+        async with FakeSGLangServer([[(-0.1, 605)]]) as sglang:  # no cached_tokens_per_turn
+            tok = FakeTokenizer(outputs={(605,): "normal reply"})
+            adapter = anthropic.AnthropicAdapter(tokenizer=tok, sglang_url=sglang.url)
+            adapter.open_session("sid-nocache")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                resp = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-nocache"},
+                    json={"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}]},
+                )
+                data = await resp.json()
+            finally:
+                await client.close()
+            await _drain(adapter, "sid-nocache")
+
+        assert resp.status == 200
+        assert "cache_read_input_tokens" not in data["usage"]
+
+    asyncio.run(run_case())
+
+
 # ===========================================================================
 
 
