@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import secrets
@@ -74,6 +75,7 @@ class SweConfig:
     boot_retries: int
     rollout_retries: int
     retry_policy: str
+    retry_min_budget_sec: float
     oh_fake_user: bool
     oh_max_iterations: int
     oh_tools: list[str]
@@ -106,6 +108,10 @@ class SweConfig:
                 f"SWE_ROLLOUT_RETRY_POLICY={retry_policy!r} invalid; "
                 f"must be pre-launch|retry-from-scratch|always-fail"
             )
+        _min_budget_env = os.environ.get("SWE_AGENT_RETRY_MIN_BUDGET_SEC")
+        retry_min_budget_sec = float(_min_budget_env) if _min_budget_env else 0.5 * agent_time_budget
+        if not math.isfinite(retry_min_budget_sec) or retry_min_budget_sec < 0:
+            raise ValueError("SWE_AGENT_RETRY_MIN_BUDGET_SEC must be a finite value >= 0")
         return cls(
             eval_protocol=os.environ.get("SWE_EVAL_PROTOCOL", swe.PROTOCOL_SCALESWE),
             train_protocol=os.environ.get("SWE_TRAIN_PROTOCOL", swe.PROTOCOL_SCALESWE),
@@ -121,6 +127,7 @@ class SweConfig:
             boot_retries=int(os.environ.get("SWE_BOOT_RETRIES", "2")),
             rollout_retries=rollout_retries,
             retry_policy=retry_policy,
+            retry_min_budget_sec=retry_min_budget_sec,
             oh_fake_user=os.environ.get("SWE_OH_FAKE_USER", "0") not in ("0", "", "false", "False"),
             oh_max_iterations=int(os.environ.get("SWE_OH_MAX_ITERATIONS", "100")),
             oh_tools=oh_tools,
@@ -411,6 +418,16 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         raise
                     turns_recorded = state.adapter.manager.has_session(session_id)
                     if not _is_retryable(error) or attempt >= CONFIG.rollout_retries:
+                        raise
+                    remaining = CONFIG.agent_time_budget_sec - (time.time() - t0)
+                    if remaining < CONFIG.retry_min_budget_sec:
+                        logger.warning(
+                            "[coding_agent_rl] %s: %.0fs agent budget remaining < "
+                            "retry_min_budget %.0fs; not retrying",
+                            instance_id,
+                            remaining,
+                            CONFIG.retry_min_budget_sec,
+                        )
                         raise
                     if CONFIG.retry_policy == "pre-launch" and turns_recorded:
                         raise
