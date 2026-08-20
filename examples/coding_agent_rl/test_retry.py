@@ -152,6 +152,18 @@ def test_retry_min_budget_empty_string_uses_default(monkeypatch):
     assert cfg.retry_min_budget_sec == 900.0
 
 
+def test_retry_min_budget_nan_rejected(monkeypatch):
+    monkeypatch.setenv("SWE_AGENT_RETRY_MIN_BUDGET_SEC", "nan")
+    with pytest.raises(ValueError, match="finite"):
+        SweConfig.from_env()
+
+
+def test_retry_min_budget_inf_rejected(monkeypatch):
+    monkeypatch.setenv("SWE_AGENT_RETRY_MIN_BUDGET_SEC", "inf")
+    with pytest.raises(ValueError, match="finite"):
+        SweConfig.from_env()
+
+
 def test_retry_policy_default():
     import os
 
@@ -869,6 +881,65 @@ async def test_budget_gate_allows_retry_when_budget_ample(monkeypatch):
     # All attempts consumed: initial + 2 retries = 3 provisioning attempts.
     assert fake_e2b_cls.call_count == 3
     assert result == ["exception:RuntimeError"]
+
+
+@pytest.mark.anyio
+async def test_budget_gate_does_not_mask_non_retryable_error(monkeypatch):
+    """A non-retryable error raises for its original reason even when budget is
+    low: the retryable/attempt check runs before the budget gate, so the gate
+    never masks a non-retryable failure.
+    """
+    from examples.coding_agent_rl import generate as gen_mod
+    from examples.coding_agent_rl.generate import generate
+
+    # Non-retryable error (ValueError) on enter; see test_not_retryable_value_error.
+    fake_sb = AsyncMock()
+    fake_sb.__aenter__ = AsyncMock(side_effect=ValueError("not a sandbox problem"))
+    fake_sb.__aexit__ = AsyncMock(return_value=False)
+    fake_e2b_cls = MagicMock(return_value=fake_sb)
+
+    state = _make_state_mock()
+    mock_harness_cls = MagicMock(return_value=AsyncMock())
+    mock_swe = MagicMock()
+    mock_swe.get_metadata.return_value = _make_sample_mock().metadata["swe_metadata"]
+    mock_swe.evaluability_check.return_value = None
+    mock_swe.prepare_workspace = AsyncMock()
+
+    async def fast_sleep(_):
+        pass
+
+    # Low budget (remaining=800 < floor=900) — the gate WOULD block a retryable
+    # error here, but this error is non-retryable so it must raise first.
+    times = iter([1000.0, 2000.0, 2000.0, 2000.0])
+    monkeypatch.setattr(gen_mod.time, "time", lambda: next(times, 2000.0))
+
+    with (
+        patch("examples.coding_agent_rl.generate._AdapterService", return_value=state),
+        patch("examples.coding_agent_rl.generate.E2BSandbox", fake_e2b_cls),
+        patch("examples.coding_agent_rl.generate.HARNESS_CLS", mock_harness_cls),
+        patch("examples.coding_agent_rl.generate.swe", mock_swe),
+        patch("examples.coding_agent_rl.generate._session_id", return_value="sess-123"),
+        patch("examples.coding_agent_rl.generate.get_prompt", return_value="prompt"),
+        patch("examples.coding_agent_rl.generate._abort_result", side_effect=lambda s, r, i: [r]),
+        patch.object(
+            gen_mod,
+            "CONFIG",
+            replace(
+                gen_mod.CONFIG,
+                retry_policy="retry-from-scratch",
+                boot_retries=1,
+                rollout_retries=2,
+                agent_time_budget_sec=1800,
+                retry_min_budget_sec=900,
+            ),
+        ),
+        patch("examples.coding_agent_rl.generate.asyncio.sleep", side_effect=fast_sleep),
+    ):
+        result = await generate(MagicMock(), _make_sample_mock(), {})
+
+    # Original (non-retryable) reason propagates; no retry, no budget-gate masking.
+    assert fake_e2b_cls.call_count == 1
+    assert result == ["exception:ValueError"]
 
 
 if __name__ == "__main__":

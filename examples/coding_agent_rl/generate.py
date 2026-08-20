@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import secrets
@@ -109,8 +110,8 @@ class SweConfig:
             )
         _min_budget_env = os.environ.get("SWE_AGENT_RETRY_MIN_BUDGET_SEC")
         retry_min_budget_sec = float(_min_budget_env) if _min_budget_env else 0.5 * agent_time_budget
-        if retry_min_budget_sec < 0:
-            raise ValueError("SWE_AGENT_RETRY_MIN_BUDGET_SEC must be >= 0")
+        if not math.isfinite(retry_min_budget_sec) or retry_min_budget_sec < 0:
+            raise ValueError("SWE_AGENT_RETRY_MIN_BUDGET_SEC must be a finite value >= 0")
         return cls(
             eval_protocol=os.environ.get("SWE_EVAL_PROTOCOL", swe.PROTOCOL_SCALESWE),
             train_protocol=os.environ.get("SWE_TRAIN_PROTOCOL", swe.PROTOCOL_SCALESWE),
