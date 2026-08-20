@@ -175,7 +175,7 @@ class BaseAdapter:
 
         self.debug_callback: Callable[..., None] | None = debug_callback
         self.tool_call_validator = tool_call_validator
-        self.tool_call_max_retries = int(tool_call_max_retries)
+        self.tool_call_max_retries = max(0, int(tool_call_max_retries))
         # per-sid turn cap: return 429 to kill the run once exceeded
         self.max_turns_per_sid: int | None = max_turns_per_sid
         self._sid_turn_count: dict[str, int] = {}

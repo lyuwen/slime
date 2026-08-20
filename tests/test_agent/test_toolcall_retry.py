@@ -294,5 +294,28 @@ def test_validate_reply_matches_reference_polarity():
     assert verdict is not None and verdict[0] == "good_tool"
 
 
+def test_multi_call_second_invalid_triggers_retry(monkeypatch):
+    async def run_case():
+        tok = FakeTokenizer()
+        # Attempt 1: two calls in one turn, first valid, SECOND invalid -> reject.
+        # Attempt 2: both valid -> accepted. Retry only fires if the validator
+        # sees the full pre-truncation call list, not just the first call.
+        gen = _scripted_generate(
+            tok,
+            [
+                _xml_call("good_tool") + _xml_call("bad_tool"),
+                _xml_call("good_tool") + _xml_call("good_tool"),
+            ],
+        )
+        monkeypatch.setattr(common, "call_sglang_generate", gen)
+        adapter = _make_adapter(tok, validator=_reject_bad_tool)
+        adapter.open_session("s6")
+        samples = await _run_one_turn(adapter, "s6")
+        assert gen.state["calls"] == 2  # retry fired on the second call being invalid
+        assert samples and all(s.metadata.get("invalid_tool_call") is False for s in samples)
+
+    asyncio.run(run_case())
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
