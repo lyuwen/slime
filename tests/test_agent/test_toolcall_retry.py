@@ -259,5 +259,41 @@ def test_generate_example_wires_validator_and_eval_flag():
     assert "is_eval=evaluation" in gen_src
 
 
+def _find_invalid_tool_call_like_reference(response_dict):
+    """Mirror of openhands.sdk ... find_invalid_tool_call polarity:
+    None if all tool calls have JSON-object arguments, else (name, raw_args)."""
+    import json as _json
+
+    for choice in response_dict.get("choices") or []:
+        for call in (choice.get("message") or {}).get("tool_calls") or []:
+            fn = call.get("function") or {}
+            name, args = fn.get("name"), fn.get("arguments")
+            try:
+                parsed = _json.loads(args) if isinstance(args, str) else args
+            except (ValueError, TypeError):
+                return (name, args if isinstance(args, str) else repr(args))
+            if not isinstance(parsed, dict):
+                return (name, args if isinstance(args, str) else repr(args))
+    return None
+
+
+def test_validate_reply_matches_reference_polarity():
+    tok = FakeTokenizer()
+    adapter = _make_adapter(tok, validator=_find_invalid_tool_call_like_reference)
+    session = common.Session(is_eval=False)
+
+    good = ParsedModelOutput(reasoning="", text="", tool_uses=[{"name": "good_tool", "input": {"a": 1}}], ill_formed=False)
+    assert adapter._validate_reply(good, session) is None
+
+    # A tool_use whose input isn't a dict becomes {"_raw_arguments": "..."} in the
+    # wire call, which IS a JSON object -> reference treats it as valid.
+    # To exercise the invalid branch, feed a raw non-JSON arguments string directly.
+    bad_dict = {"choices": [{"message": {"tool_calls": [
+        {"function": {"name": "good_tool", "arguments": "{not json"}}
+    ]}}]}
+    verdict = _find_invalid_tool_call_like_reference(bad_dict)
+    assert verdict is not None and verdict[0] == "good_tool"
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
