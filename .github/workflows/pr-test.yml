@@ -763,6 +763,10 @@ jobs:
             },
             {
               "num_gpus": 0,
+              "test_file": "test_agent/test_toolcall_retry.py"
+            },
+            {
+              "num_gpus": 0,
               "test_file": "test_tools/test_repackage_oh_env.py"
             }
           ]
