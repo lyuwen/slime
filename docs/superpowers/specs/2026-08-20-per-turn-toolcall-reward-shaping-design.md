@@ -131,17 +131,36 @@ trajectory can linearize into multiple `Sample`s (forks). So:
 
 ## Module boundaries (where code lives)
 
-The annotator is a standalone package in `thirdparty/` (not a slime dependency;
-nothing in `slime/` or `examples/` imports it today). Treat it as a pure library
-and keep the coupling inside the example that opts in.
+The annotator is an **external, pip-installed package** (`toolcall-annotation`,
+top-level module `toolcall_annotation`; in the current environment an editable
+install resolving outside the slime tree). It is NOT vendored into slime and NOT
+a declared slime dependency; the `thirdparty/toolcall-annotation/` directory seen
+on some checkouts is a working-tree convenience, untracked and unpackaged. Treat
+it as a normal third-party import and keep the coupling inside the example that
+opts in.
 
-**1. Third-party package** — one additive pure helper, no other changes:
-```python
-# toolcall_annotation/annotators/toolcall_correctness_impl.py  (append)
-def count_turn_toolcall_errors(assistant_message, tool_responses_by_id) -> int:
-    """Total detected tool-call errors across one assistant turn's tool calls."""
-```
-Plus a unit test. Existing class/registry/CLI/report untouched.
+**Dependency handling (external, undeclared):**
+- The import is a plain top-level `from toolcall_annotation.annotators import
+  toolcall_correctness_impl` — resolved from the installed package.
+- `examples/coding_agent_rl/turn_shaping.py` imports it **lazily**, only when
+  `beta != 0`. With the feature off (default), the module is never imported, so
+  runs without the package installed are unaffected.
+- When enabled but the package is missing, raise a clear, actionable error
+  ("install toolcall-annotation") rather than an opaque `ModuleNotFoundError`
+  surfacing mid-rollout on a Ray worker.
+- Because scoring runs in-process during rollout on every worker,
+  `toolcall_annotation` must be importable cluster-wide when the feature is
+  enabled. The run script / environment is responsible for installing it on all
+  workers; the example does not vendor it.
+
+**1. Annotator (external package)** — used as-is, NOT modified. The example
+consumes the existing pure functions (`parse_arguments`, `find_tool_response`,
+and the per-tool `check_*`) directly. Rationale: the package is installed
+cluster-wide (possibly editable at a machine-specific path); adding code to it
+would require re-releasing/re-installing it on every worker and couples slime's
+feature to the annotator's release cadence. The per-turn "count errors across a
+turn's tool calls" glue therefore lives in the example (see item 3), which is
+where the annotator dependency already lives.
 
 **2. slime core** — minimal mechanical plumbing, no new abstractions:
 - `slime/agent/trajectory.py`
@@ -169,11 +188,14 @@ Plus a unit test. Existing class/registry/CLI/report untouched.
 
 **3. Example wiring** (`examples/coding_agent_rl/`) — where the two worlds meet:
 - New module `turn_shaping.py`:
-  - `make_turn_scorer()` → a callback that imports `toolcall_annotation` and
-    returns the raw per-turn **errored-call count** (an int per turn),
-    annotator-specific and knob-free. `beta` and `budget` are NOT applied here:
-    the scorer only knows how to count errors, keeping the annotator coupling
-    purely about detection.
+  - `count_turn_toolcall_errors(assistant_message, tool_responses_by_id) -> int`
+    — the glue over the annotator's existing pure functions (`parse_arguments`,
+    per-tool `check_*`), dispatched by tool name. Lives here (not in the
+    annotator package) so the annotator is used unmodified.
+  - `make_turn_scorer()` → a callback that lazily imports `toolcall_annotation`
+    and returns the raw per-turn **errored-call count** (an int per turn) via
+    `count_turn_toolcall_errors`. Knob-free: `beta`/`budget` are NOT applied
+    here, keeping the annotator coupling purely about detection.
   - The manager owns the reward math. `TrajectoryManager` receives `beta` and
     `budget` (alongside the scorer) and applies `-beta * count` per turn plus the
     per-trajectory budget cap. Rationale: the budget cap must sum across all
@@ -215,9 +237,10 @@ Harmless when `beta=0` (falls back to plain GRPO).
 
 ## Testing
 
-**Third-party package** (`thirdparty/toolcall-annotation/tests/`)
+**Annotator glue** (in the example, `examples/coding_agent_rl/`, CPU)
 - `count_turn_toolcall_errors`: clean turn → 0; one malformed-args call → 1;
-  multi-call turn with 2 bad → 2; turn with no tool call → 0.
+  multi-call turn with 2 bad → 2; turn with no tool call → 0. (The annotator
+  package itself is used unmodified and keeps its own test suite.)
 
 **slime core** (`tests/`, CPU, `pytest.main([__file__])` pattern)
 - Inject a fake `turn_scorer` into `TrajectoryManager`; feed a 3-turn session;
