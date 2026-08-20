@@ -371,7 +371,9 @@ class BaseAdapter:
             # disconnected during generation makes _respond raise here, and we
             # must not record a turn the client never received.
             try:
-                response = await self._respond(request, body, reply, in_tok, out_tok, stream, cached_tok=turn.cached_tokens)
+                response = await self._respond(
+                    request, body, reply, in_tok, out_tok, stream, cached_tok=turn.cached_tokens
+                )
             except (ConnectionResetError, asyncio.CancelledError) as e:
                 self.logger.warning(
                     "[%s] sid=%s client disconnected before response flush: %s after %.1fs",

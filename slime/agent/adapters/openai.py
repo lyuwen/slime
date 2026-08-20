@@ -290,13 +290,13 @@ def _request_session_id(request: web.Request, body: dict) -> str:
     return sid_from_bearer(request) or sid_from_body(body) or "default"
 
 
-def _usage(in_tok: int, out_tok: int, cached_tok: int = 0) -> dict:
-    usage: dict = {
+def _usage(in_tok: int, out_tok: int, cached_tok: int = 0) -> dict[str, Any]:
+    usage: dict[str, Any] = {
         "prompt_tokens": in_tok,
         "completion_tokens": out_tok,
         "total_tokens": in_tok + out_tok,
     }
-    if cached_tok > 0:
+    if cached_tok > 0:  # only set when sglang runs with --enable-cache-report
         usage["prompt_tokens_details"] = {"cached_tokens": cached_tok}
     return usage
 

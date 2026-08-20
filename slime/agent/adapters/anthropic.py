@@ -195,9 +195,11 @@ def _request_session_id(request: web.Request) -> str:
     return sid_from_bearer(request) or (request.headers.get("X-Api-Key") or "").strip() or "default"
 
 
-def _render_response(body: dict, blocks: list[dict], stop_reason: str, in_tok: int, out_tok: int, cached_tok: int = 0) -> dict:
-    usage: dict = {"input_tokens": in_tok, "output_tokens": out_tok}
-    if cached_tok > 0:
+def _render_response(
+    body: dict, blocks: list[dict], stop_reason: str, in_tok: int, out_tok: int, cached_tok: int = 0
+) -> dict:
+    usage: dict[str, int] = {"input_tokens": in_tok, "output_tokens": out_tok}
+    if cached_tok > 0:  # only set when sglang runs with --enable-cache-report
         usage["cache_read_input_tokens"] = cached_tok
     return {
         "id": f"msg_{secrets.token_hex(12)}",
@@ -225,8 +227,8 @@ async def _render_stream(request, blocks, stop_reason, in_tok, out_tok, cached_t
     )
     await out.prepare(request)
 
-    ms_usage: dict = {"input_tokens": in_tok, "output_tokens": 0}
-    if cached_tok > 0:
+    ms_usage: dict[str, int] = {"input_tokens": in_tok, "output_tokens": 0}
+    if cached_tok > 0:  # only set when sglang runs with --enable-cache-report
         ms_usage["cache_read_input_tokens"] = cached_tok
     ms_data = {
         "type": "message_start",
