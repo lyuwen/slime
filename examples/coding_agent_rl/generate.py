@@ -147,6 +147,10 @@ def resolve_shaping_config():
     """
     beta = float(os.environ.get("SWE_TOOLCALL_SHAPING_BETA", "0.0"))
     budget = float(os.environ.get("SWE_TOOLCALL_SHAPING_BUDGET", "1.0"))
+    if not math.isfinite(beta) or beta < 0:
+        raise ValueError(f"SWE_TOOLCALL_SHAPING_BETA must be a finite value >= 0, got {beta!r}")
+    if not math.isfinite(budget) or budget < 0:
+        raise ValueError(f"SWE_TOOLCALL_SHAPING_BUDGET must be a finite value >= 0, got {budget!r}")
     scorer = make_turn_scorer() if beta != 0.0 else None
     return beta, budget, scorer
 

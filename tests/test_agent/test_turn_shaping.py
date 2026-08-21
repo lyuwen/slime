@@ -68,6 +68,82 @@ def _two_turn_session(mgr, sid, *, r1, r2):
     )
 
 
+def test_realign_masked_span_excluded_from_budget():
+    """REALIGN masks out turn 1's response (loss_mask=0), but its turn_spans entry
+    (trained=True) survives. Shaping must NOT spend budget on those masked-out
+    tokens: the shaping vector must be 0 wherever loss_mask==0, and a 1.0 budget
+    must land entirely on the live (loss_mask==1) tokens.
+
+    Construction mirrors test_2_4_drift_case_B1_short_replaces in
+    test_trajectory_manager_branching.py: turn 2's prompt drifts inside turn 1's
+    most-recent response span (drift_replace at the last echoed token) and the
+    incoming response is short (< fork_threshold), so classify_token_drift returns
+    REALIGN — overwriting turn 1's response as loss_mask=0.
+    """
+
+    # scorer flags turn 1 (the realigned/masked span) as errored.
+    def scorer(node):
+        return 1
+
+    mgr = TrajectoryManager(turn_scorer=scorer, shaping_beta=0.25, shaping_budget=1.0)
+    sid = "realign"
+
+    # turn 1: system+user prompt, 3-token trained response.
+    p1 = SYS + USR + [9000]  # prompt ends with the assistant/gen marker
+    resp1 = [9001, 9002, 9003]
+    mgr.record_turn(
+        sid,
+        turn=_turn(p1, resp1),
+        prompt_messages=[{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
+        response_message=_asst_msg("a1"),
+    )
+
+    # turn 2: prompt echoes p1 + resp1, then a tool/user follow-up + gen marker,
+    # but with a drift INSIDE resp1's echoed span (last echoed token replaced).
+    p2_honest = p1 + resp1 + [3000, 3001, 9000]
+    drift_idx = len(p1) + len(resp1) - 1  # last token of resp1's echo -> inside the span
+    p2 = list(p2_honest)
+    p2[drift_idx] = 7001  # sentinel drift token (drift_replace)
+    resp2 = [9004, 9005]  # short -> len < default fork_threshold -> REALIGN
+    mgr.record_turn(
+        sid,
+        turn=_turn(p2, resp2),
+        prompt_messages=[
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u"},
+            _asst_msg("a1"),
+            {"role": "user", "content": "f"},
+        ],
+        response_message=_asst_msg("a2"),
+    )
+
+    samples = mgr.get_trajectory(sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
+    assert len(samples) == 1, f"REALIGN should yield one merged sample, got {len(samples)}"
+    s = samples[0]
+    vec = s.metadata["toolcall_turn_shaping"]
+    assert len(vec) == s.response_length == len(s.loss_mask)
+
+    # (1) Shaping is zero at every masked-out position (the realigned turn-1 span).
+    for v, m in zip(vec, s.loss_mask, strict=True):
+        if m == 0:
+            assert v == 0.0, "shaping leaked onto a loss_mask==0 token"
+
+    # (2) There is at least one masked-out token (proving REALIGN actually fired
+    # and turn 1's trained span was demoted to context).
+    assert 0 in s.loss_mask, "expected REALIGN to demote turn-1 response to loss_mask=0"
+
+    # (3) The budget denominator counts only live tokens. Turn 2 has 2 live,
+    # errored tokens at beta=0.25 -> raw |shaping| = 0.5, which is under the 1.0
+    # budget, so NO scale-down happens (budget is a cap, not a target). Crucially,
+    # the 3 masked-out turn-1 tokens contribute 0 to the denominator: pre-fix they
+    # would have added 0.75, forcing a spurious 1.0/1.25=0.8 scale-down and
+    # smearing penalty onto masked tokens.
+    total_abs = sum(abs(v) for v in vec)
+    assert abs(total_abs - 0.5) < 1e-9, f"budget denominator included masked tokens: {total_abs}"
+    live_nonzero = [v for v, m in zip(vec, s.loss_mask, strict=True) if m == 1 and v != 0.0]
+    assert live_nonzero == [-0.25, -0.25], f"live tokens not penalized un-scaled: {live_nonzero}"
+
+
 def test_shaping_absent_when_scorer_none():
     """Default (no scorer) leaves metadata free of the shaping key."""
     mgr = TrajectoryManager()

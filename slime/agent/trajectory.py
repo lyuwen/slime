@@ -402,8 +402,17 @@ class TrajectoryManager:
                 errors = int(self._turn_scorer(node))
                 if errors:
                     penalty = -self._shaping_beta * errors
-                    for i in range(start, start + length):
-                        vec[i] = penalty
+                    # Only shape live tokens. A REALIGN overwrites a preceding
+                    # response span to loss_mask=0 without removing its (trained)
+                    # turn_spans entry, so a stale span may cover masked-out or
+                    # rewritten-shorter tokens. Respecting the final loss mask here
+                    # keeps those tokens out of the budget denominator and prevents
+                    # mis-attributing penalty to the new response's tokens. Clamp to
+                    # len(vec): the token buffer is rebuilt on REALIGN, so a stale
+                    # span length may exceed the current buffer.
+                    for i in range(start, min(start + length, len(vec))):
+                        if builder.loss_mask[i] == 1:
+                            vec[i] = penalty
             raw_full.append(vec)
 
         total_abs = sum(abs(v) for vec in raw_full for v in vec)

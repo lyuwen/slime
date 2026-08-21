@@ -100,6 +100,27 @@ def test_compute_advantage_without_shaping_key():
     assert torch.allclose(rollout_data["advantages"][0], torch.tensor([1.0, 1.0, 1.0]))
 
 
+def test_shaping_config_rejects_invalid_values(monkeypatch):
+    """resolve_shaping_config must reject non-finite / negative beta and budget:
+    a negative budget flips the penalty sign, beta=inf yields NaN shaping, and a
+    negative beta silently enables shaping with a flipped sign (the gate is
+    beta != 0.0). All must raise ValueError.
+    """
+    from examples.coding_agent_rl.generate import resolve_shaping_config
+
+    for bad_beta in ("-1", "inf", "nan"):
+        monkeypatch.setenv("SWE_TOOLCALL_SHAPING_BETA", bad_beta)
+        monkeypatch.setenv("SWE_TOOLCALL_SHAPING_BUDGET", "1.0")
+        with pytest.raises(ValueError):
+            resolve_shaping_config()
+
+    # invalid budget with a valid (enabling) beta
+    monkeypatch.setenv("SWE_TOOLCALL_SHAPING_BETA", "0.3")
+    monkeypatch.setenv("SWE_TOOLCALL_SHAPING_BUDGET", "-1")
+    with pytest.raises(ValueError):
+        resolve_shaping_config()
+
+
 def test_shaping_config_from_env(monkeypatch):
     """CONFIG reads beta/budget from SWE_ env vars; scorer built only when beta!=0."""
 

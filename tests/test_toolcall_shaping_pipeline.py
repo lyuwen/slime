@@ -158,6 +158,37 @@ def test_shaping_survives_convert_with_loss_mask_shape():
         assert len(shp) == len(lm)
 
 
+def test_tensorize_promotes_shaping_to_float32_tensors():
+    """The REAL _tensorize_rollout_data_for_training must turn a per-sample
+    list-of-float-lists ``toolcall_turn_shaping`` into a list of float32 tensors,
+    mirroring how ``rollout_log_probs`` is tensorized.
+
+    This is the actor-preparation crash path (finding 1): if the key is not in
+    _ROLLOUT_DATA_TENSOR_DTYPES it stays a Python list and the actor's ``.to(...)``
+    loop raises AttributeError: 'list' object has no attribute 'to'.
+    """
+    import torch
+
+    from slime.ray.rollout import _tensorize_rollout_data_for_training
+
+    rollout_data = {
+        # per-sample lists, shaped exactly like rollout_log_probs
+        "rollout_log_probs": [[0.0, -0.5, -0.5], [0.0, 0.0]],
+        "toolcall_turn_shaping": [[0.0, -0.5, -0.5], [0.0, 0.0]],
+    }
+    _tensorize_rollout_data_for_training(rollout_data)
+
+    for key in ("rollout_log_probs", "toolcall_turn_shaping"):
+        assert isinstance(rollout_data[key], list)
+        for elem in rollout_data[key]:
+            assert isinstance(elem, torch.Tensor), f"{key} element not tensorized: {type(elem)}"
+            assert elem.dtype == torch.float32
+    # element-wise structure matches rollout_log_probs (list of 1-D tensors)
+    assert [t.shape for t in rollout_data["toolcall_turn_shaping"]] == [
+        t.shape for t in rollout_data["rollout_log_probs"]
+    ]
+
+
 def test_cp_slice_included_for_shaping_key():
     """The _get_rollout_data field loop must list toolcall_turn_shaping so it is
     CP-sliced and tensorized alongside rollout_log_probs.
