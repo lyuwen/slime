@@ -39,7 +39,7 @@ from slime.agent.adapters import AnthropicAdapter, OpenAIAdapter
 from slime.agent.aiohttp_threaded import FilteredAccessLogger, run_app_in_thread
 from slime.agent.harness import ClaudeCodeHarness, CodexHarness, OpenHandsHarness
 from slime.agent.sandbox import E2BSandbox, is_fresh_sandbox_retryable
-from slime.utils.misc import SingletonMeta
+from slime.utils.misc import SingletonMeta, load_function
 from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
 
@@ -283,6 +283,8 @@ class _AdapterService(metaclass=SingletonMeta):
                 "sandboxes can reach for reverse-connection to the adapter; "
                 "without it the sandbox cannot dial back and the rollout aborts."
             )
+        validator_path = getattr(args, "tool_call_validator_path", None)
+        tool_call_validator = load_function(validator_path) if validator_path else None
         self.adapter = ADAPTER_CLS(
             tokenizer=self.tokenizer,
             sglang_url=sglang_url,
@@ -290,6 +292,8 @@ class _AdapterService(metaclass=SingletonMeta):
             reasoning_parser=self.reasoning_parser,
             fork_threshold_tokens=CONFIG.fork_merge_threshold,
             chat_template_kwargs=getattr(args, "apply_chat_template_kwargs", None),
+            tool_call_validator=tool_call_validator,
+            tool_call_max_retries=int(getattr(args, "tool_call_max_retries", 3)),
         )
         # handler_cancellation=True so a client disconnect cancels the handler
         # coroutine, arming the fire-and-forget /abort_request in the adapter.
@@ -386,6 +390,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                             session_id,
                             sampling_defaults=sampling_params,
                             max_context_tokens=state.max_context_len,
+                            is_eval=evaluation,
                         )
                         session_open = True
                         oh_kwargs = (
