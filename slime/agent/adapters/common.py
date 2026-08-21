@@ -151,6 +151,9 @@ class BaseAdapter:
         fork_threshold_tokens: int | None = None,
         chat_template_kwargs: dict | None = None,
         debug_callback: Callable[..., None] | None = None,
+        turn_scorer: Callable[..., int] | None = None,
+        shaping_beta: float = 0.0,
+        shaping_budget: float = 1.0,
     ) -> None:
         self.tokenizer = tokenizer
         self.sglang_url = sglang_url.rstrip("/") if isinstance(sglang_url, str) else sglang_url
@@ -164,9 +167,12 @@ class BaseAdapter:
 
         # one manager shared across all sids; per-sid trees live inside it.
         # fork_threshold_tokens left None means the manager uses its own default.
-        mgr_kwargs: dict[str, int] = {}
+        mgr_kwargs: dict[str, Any] = {}
         if fork_threshold_tokens is not None:
             mgr_kwargs["fork_threshold_tokens"] = fork_threshold_tokens
+        mgr_kwargs["turn_scorer"] = turn_scorer
+        mgr_kwargs["shaping_beta"] = shaping_beta
+        mgr_kwargs["shaping_budget"] = shaping_budget
         self.manager = TrajectoryManager(**mgr_kwargs)
 
         self.debug_callback: Callable[..., None] | None = debug_callback

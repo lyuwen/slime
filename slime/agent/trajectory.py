@@ -174,6 +174,9 @@ class _SampleBuilder:
         self.prompt_tokens: int = 0
         self.completion_tokens: int = 0
         self.cached_tokens: int = 0
+        # Per-turn token spans for reward shaping: (response_start, response_len,
+        # source_node, trained), in token order. Filled by append_turn.
+        self.turn_spans: list[tuple[int, int, MessageNode, bool]] = []
 
     def classify_token_drift(self, turn: TurnRecord) -> DriftKind:
         """Decide how this builder should absorb ``turn``'s prompt.
@@ -199,7 +202,9 @@ class _SampleBuilder:
             return DriftKind.REALIGN
         return DriftKind.FORK
 
-    def append_turn(self, turn: TurnRecord, kind: DriftKind, *, trained: bool = True) -> None:
+    def append_turn(
+        self, turn: TurnRecord, kind: DriftKind, *, source_node: MessageNode, trained: bool = True
+    ) -> None:
         """Append one turn into this SampleBuilder, branching on ``kind``: for REALIGN
         we overwrite the already-saved response span, for CLEAN we just append this
         turn's prompt tail."""
@@ -215,6 +220,7 @@ class _SampleBuilder:
 
         # --- append this turn's generated response (loss_mask=1 unless re-emitted as context) ---
         self.last_response_start_idx = len(self.tokens)
+        self.turn_spans.append((self.last_response_start_idx, len(turn.output_ids), source_node, trained))
         self._append_tokens(
             turn.output_ids, loss_mask=int(trained), logprobs=turn.output_log_probs if trained else None
         )
@@ -286,10 +292,20 @@ class _SampleBuilder:
 
 
 class TrajectoryManager:
-    def __init__(self, *, fork_threshold_tokens: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fork_threshold_tokens: int | None = None,
+        turn_scorer=None,
+        shaping_beta: float = 0.0,
+        shaping_budget: float = 1.0,
+    ) -> None:
         self._fork_threshold: int = 1024 if fork_threshold_tokens is None else fork_threshold_tokens
         self._trees: dict[str, MessageNode] = {}
         self._turn_count: dict[str, int] = {}
+        self._turn_scorer = turn_scorer
+        self._shaping_beta = float(shaping_beta)
+        self._shaping_budget = float(shaping_budget)
 
     # -------------------- public ------------------------------------------
 
@@ -345,15 +361,18 @@ class TrajectoryManager:
             return []
 
         samples: list[Sample] = []
+        pairs: list[tuple[Sample, _SampleBuilder]] = []
         for routing_leaf in root.leaves():
             if routing_leaf.is_root:
                 continue
             chain = routing_leaf.path_from_root()
-            samples.extend(
-                self._chain_to_samples(
-                    chain, base_sample=base_sample, extra_metadata=extra_metadata, max_sample_tokens=max_sample_tokens
-                )
+            chain_samples, chain_pairs = self._chain_to_samples(
+                chain, base_sample=base_sample, extra_metadata=extra_metadata, max_sample_tokens=max_sample_tokens
             )
+            samples.extend(chain_samples)
+            pairs.extend(chain_pairs)
+
+        self._apply_turn_shaping(pairs)
 
         for s in samples:
             s.reward = reward
@@ -361,6 +380,51 @@ class TrajectoryManager:
         self._trees.pop(sid, None)
         self._turn_count.pop(sid, None)
         return samples
+
+    def _apply_turn_shaping(self, pairs: list[tuple[Sample, _SampleBuilder]]) -> None:
+        """Write a dense per-token shaping vector to each sample's metadata.
+
+        For every trained turn span, fill -beta * error_count over that span,
+        then cap the summed |shaping| across ALL samples of the session to
+        shaping_budget (proportional scale-down; never scales up). No-op when no
+        scorer is configured or beta == 0.
+        """
+        if self._turn_scorer is None or self._shaping_beta == 0.0:
+            return
+
+        # Raw penalties per sample, in full-token space (pre first-turn strip).
+        raw_full: list[list[float]] = []
+        for _sample, builder in pairs:
+            vec = [0.0] * len(builder.tokens)
+            for start, length, node, trained in builder.turn_spans:
+                if not trained or length == 0:
+                    continue
+                errors = int(self._turn_scorer(node))
+                if errors:
+                    penalty = -self._shaping_beta * errors
+                    # Only shape live tokens. A REALIGN overwrites a preceding
+                    # response span to loss_mask=0 without removing its (trained)
+                    # turn_spans entry, so a stale span may cover masked-out or
+                    # rewritten-shorter tokens. Respecting the final loss mask here
+                    # keeps those tokens out of the budget denominator and prevents
+                    # mis-attributing penalty to the new response's tokens. Clamp to
+                    # len(vec): the token buffer is rebuilt on REALIGN, so a stale
+                    # span length may exceed the current buffer.
+                    for i in range(start, min(start + length, len(vec))):
+                        if builder.loss_mask[i] == 1:
+                            vec[i] = penalty
+            raw_full.append(vec)
+
+        total_abs = sum(abs(v) for vec in raw_full for v in vec)
+        scale = (self._shaping_budget / total_abs) if total_abs > self._shaping_budget else 1.0
+
+        for (sample, builder), vec in zip(pairs, raw_full, strict=True):
+            start = builder.leading_prompt_len
+            sliced = [v * scale for v in vec[start : start + sample.response_length]]
+            # Guard: to_sample may have truncated; pad/trim to response_length.
+            if len(sliced) < sample.response_length:
+                sliced = sliced + [0.0] * (sample.response_length - len(sliced))
+            sample.metadata = {**(sample.metadata or {}), "toolcall_turn_shaping": sliced}
 
     def drop_session(self, sid: str) -> None:
         self._trees.pop(sid, None)
@@ -490,9 +554,9 @@ class TrajectoryManager:
 
             if not builders or (kind := builders[-1].classify_token_drift(asst_node.turn)) is DriftKind.FORK:
                 builders.append(_SampleBuilder(self._fork_threshold))
-                builders[-1].append_turn(asst_node.turn, DriftKind.CLEAN, trained=trained)
+                builders[-1].append_turn(asst_node.turn, DriftKind.CLEAN, source_node=asst_node, trained=trained)
             else:
-                builders[-1].append_turn(asst_node.turn, kind, trained=trained)
+                builders[-1].append_turn(asst_node.turn, kind, source_node=asst_node, trained=trained)
         return builders
 
     def _chain_to_samples(
@@ -502,7 +566,7 @@ class TrajectoryManager:
         base_sample: Sample,
         extra_metadata: dict[str, Any] | None,
         max_sample_tokens: int = 0,
-    ) -> list[Sample]:
+    ) -> tuple[list[Sample], list[tuple[Sample, _SampleBuilder]]]:
 
         asst_nodes = [n for n in chain if n.role == "assistant" and n.turn is not None]
         truncated = bool(asst_nodes) and asst_nodes[-1].turn.finish_reason == "length"
@@ -515,6 +579,7 @@ class TrajectoryManager:
             "ill_formed": ill_formed,
         }
         samples: list[Sample] = []
+        pairs: list[tuple[Sample, _SampleBuilder]] = []
         for builder in self._split_chain_into_builders(chain):
             if not builder.has_trained_response():
                 continue
@@ -523,7 +588,8 @@ class TrajectoryManager:
             sample.prefix_cache_info.total_prompt_tokens = builder.prompt_tokens
             sample.prefix_cache_info.completion_tokens = builder.completion_tokens
             samples.append(sample)
-        return samples
+            pairs.append((sample, builder))
+        return samples, pairs
 
 
 __all__ = [

@@ -41,6 +41,7 @@ _ROLLOUT_DATA_TENSOR_DTYPES = {
     "tokens": torch.long,
     "loss_masks": torch.int,
     "rollout_log_probs": torch.float32,
+    "toolcall_turn_shaping": torch.float32,
     "rollout_top_p_token_ids": torch.int32,
     "rollout_top_p_token_offsets": torch.int32,
     "teacher_log_probs": torch.float32,
@@ -789,6 +790,13 @@ class RolloutManager:
         if samples[0].rollout_log_probs is not None:
             train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
 
+        # Add per-token toolcall-correctness shaping when present (feature off by default)
+        if any(sample.metadata and "toolcall_turn_shaping" in sample.metadata for sample in samples):
+            train_data["toolcall_turn_shaping"] = [
+                (sample.metadata or {}).get("toolcall_turn_shaping", [0.0] * sample.response_length)
+                for sample in samples
+            ]
+
         if getattr(self.args, "rollout_top_p", 1.0) != 1.0:
             for sample in samples:
                 assert sample.rollout_top_p_token_ids is not None
@@ -866,6 +874,7 @@ class RolloutManager:
                 "rollout_ids",
                 "rollout_mask_sums",
                 "rollout_log_probs",
+                "toolcall_turn_shaping",
                 "rollout_top_p_token_ids",
                 "rollout_top_p_token_offsets",
                 "rollout_routed_experts",

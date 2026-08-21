@@ -120,6 +120,9 @@ ALGO_ARGS=(
    --eps-clip 0.2
    --eps-clip-high 0.28
 )
+# The tool-call shaping advantage hook is appended below ONLY when shaping is
+# enabled (SWE_TOOLCALL_SHAPING_BETA != 0), so an unconfigured run uses slime's
+# built-in GRPO advantage path unchanged.
 
 OPTIMIZER_ARGS=(
    --optimizer adam
@@ -209,6 +212,19 @@ export SWE_EVAL_MAX_ATTEMPTS="${SWE_EVAL_MAX_ATTEMPTS:-3}"
 export SWE_ROLLOUT_RETRIES="${SWE_ROLLOUT_RETRIES:-3}"
 export SWE_ROLLOUT_RETRY_POLICY="${SWE_ROLLOUT_RETRY_POLICY:-pre-launch}"
 export SWE_BOOT_CONCURRENCY="${SWE_BOOT_CONCURRENCY:-16}"
+
+# ============ tool-call reward shaping (off by default) ============
+# beta=0.0 disables the feature entirely (no annotator import). When enabled,
+# toolcall-annotation must be installed on every Ray worker.
+export SWE_TOOLCALL_SHAPING_BETA="${SWE_TOOLCALL_SHAPING_BETA:-0.0}"
+export SWE_TOOLCALL_SHAPING_BUDGET="${SWE_TOOLCALL_SHAPING_BUDGET:-1.0}"
+
+# Wire the custom advantage hook only when shaping is enabled. When beta is 0
+# (the default) the flag is omitted entirely, so training uses the built-in GRPO
+# advantage path exactly as before — the feature stays a fully inactive gate.
+if [ "${SWE_TOOLCALL_SHAPING_BETA}" != "0.0" ] && [ "${SWE_TOOLCALL_SHAPING_BETA}" != "0" ]; then
+   ALGO_ARGS+=(--custom-advantage-function-path examples.coding_agent_rl.turn_shaping.compute_advantage)
+fi
 
 # ============ proxy bypass for in-cluster traffic ============
 export no_proxy="127.0.0.1,${MASTER_ADDR},${ADAPTER_PUBLIC_HOST}"
