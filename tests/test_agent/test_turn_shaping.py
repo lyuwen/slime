@@ -132,16 +132,15 @@ def test_realign_masked_span_excluded_from_budget():
     # and turn 1's trained span was demoted to context).
     assert 0 in s.loss_mask, "expected REALIGN to demote turn-1 response to loss_mask=0"
 
-    # (3) The budget denominator counts only live tokens. Turn 2 has 2 live,
-    # errored tokens at beta=0.25 -> raw |shaping| = 0.5, which is under the 1.0
-    # budget, so NO scale-down happens (budget is a cap, not a target). Crucially,
-    # the 3 masked-out turn-1 tokens contribute 0 to the denominator: pre-fix they
-    # would have added 0.75, forcing a spurious 1.0/1.25=0.8 scale-down and
-    # smearing penalty onto masked tokens.
+    # (3) Turn 2 has 1 error and 2 live tokens. The turn's TOTAL penalty is a
+    # fixed -beta*errors = -0.25, distributed uniformly over its 2 live tokens ->
+    # -0.125 each; sum = -0.25, well under the 1.0 budget, so no scale-down.
+    # Crucially the 3 masked-out turn-1 tokens contribute 0 to total_abs (both to
+    # the budget denominator and the shaping), so total_abs == 0.25 exactly.
     total_abs = sum(abs(v) for v in vec)
-    assert abs(total_abs - 0.5) < 1e-9, f"budget denominator included masked tokens: {total_abs}"
+    assert abs(total_abs - 0.25) < 1e-9, f"budget denominator included masked tokens: {total_abs}"
     live_nonzero = [v for v, m in zip(vec, s.loss_mask, strict=True) if m == 1 and v != 0.0]
-    assert live_nonzero == [-0.25, -0.25], f"live tokens not penalized un-scaled: {live_nonzero}"
+    assert live_nonzero == [-0.125, -0.125], f"live tokens not penalized as fixed/-N: {live_nonzero}"
 
 
 def test_shaping_absent_when_scorer_none():
@@ -154,7 +153,8 @@ def test_shaping_absent_when_scorer_none():
 
 
 def test_shaping_penalizes_errored_turn_only():
-    """Scorer flags turn 2 (1 error); its response tokens get -beta, turn 1 stays 0."""
+    """Scorer flags turn 2 (1 error); its total penalty -beta is spread over turn
+    2's live tokens, turn 1 stays 0."""
     # scorer: 0 errors for first generated turn, 1 error for the second
     seen = []
 
@@ -169,15 +169,18 @@ def test_shaping_penalizes_errored_turn_only():
     s = samples[0]
     vec = s.metadata["toolcall_turn_shaping"]
     assert len(vec) == s.response_length
-    # response region = resp1(3) + prompt2 tail + resp2(2). Only resp2 tokens are -0.5.
+    # response region = resp1(3) + prompt2 tail + resp2(2). Only resp2's 2 tokens
+    # carry the turn's fixed -0.5 total, spread uniformly -> -0.25 each.
     assert vec[:3] == [0.0, 0.0, 0.0]  # turn 1 response, clean
-    assert vec[-2:] == [-0.5, -0.5]  # turn 2 response, 1 error * -0.5
+    assert vec[-2:] == [-0.25, -0.25]  # turn 2 response: -beta/2 per live token
+    assert abs(sum(vec[-2:]) + 0.5) < 1e-9  # turn total == -beta*errors
     # non-response prompt-tail tokens between the two responses are 0
     assert set(vec[3:-2]) <= {0.0}
 
 
 def test_budget_cap_scales_total():
-    """Total |shaping| is capped at budget; proportions preserved."""
+    """Total |shaping| is capped at budget; per-turn fixed penalties scaled down
+    proportionally."""
 
     def scorer(node):
         return 1  # every turn errs once
@@ -187,12 +190,73 @@ def test_budget_cap_scales_total():
     samples = mgr.get_trajectory("sid", base_sample=Sample(index=0, prompt=""), reward=1.0)
     vec = samples[0].metadata["toolcall_turn_shaping"]
     total = sum(vec)
-    # raw total = -(3 + 2) = -5 over 5 response tokens; capped to -1.0
+    # raw per-turn totals = -1.0 (turn1) + -1.0 (turn2) => total_abs 2.0; capped to
+    # -1.0 (scale 0.5). Distributed: turn1 over 3 live tokens, turn2 over 2.
     assert abs(total + 1.0) < 1e-6
-    # all nonzero entries equal (uniform -beta before scaling), scaled uniformly
+    # nonzero entries: 3 from turn1 (=-0.5/3) + 2 from turn2 (=-0.5/2)
     nonzero = [v for v in vec if v != 0.0]
     assert len(nonzero) == 5
-    assert all(abs(v - nonzero[0]) < 1e-9 for v in nonzero)
+    # each turn's scaled total is -0.5; proportions preserved across turns
+    assert abs(sum(v for v in nonzero if abs(v - (-0.5 / 3)) < 1e-9) + 0.5) < 1e-9
+    assert abs(sum(v for v in nonzero if abs(v - (-0.25)) < 1e-9) + 0.5) < 1e-9
+
+
+def _single_turn_session(mgr, sid, *, response_ids, r="a1"):
+    """One clean turn: system+user prompt, a trained response of the given ids."""
+    p1 = SYS + USR
+    mgr.record_turn(
+        sid,
+        turn=_turn(p1, response_ids),
+        prompt_messages=[{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
+        response_message=_asst_msg(r),
+    )
+
+
+def test_turn_length_invariance():
+    """The whole point of the normalization: a single-error turn's TOTAL shaping is
+    -beta regardless of how many trained tokens it emitted."""
+
+    def scorer(node):
+        return 1
+
+    beta = 0.5
+    # Short response (3 tokens).
+    mgr_a = TrajectoryManager(turn_scorer=scorer, shaping_beta=beta, shaping_budget=100.0)
+    _single_turn_session(mgr_a, "a", response_ids=[9001, 9002, 9003])
+    vec_a = mgr_a.get_trajectory("a", base_sample=Sample(index=0, prompt=""))[0].metadata["toolcall_turn_shaping"]
+
+    # Long response (10 tokens).
+    mgr_b = TrajectoryManager(turn_scorer=scorer, shaping_beta=beta, shaping_budget=100.0)
+    _single_turn_session(mgr_b, "b", response_ids=list(range(9001, 9011)))
+    vec_b = mgr_b.get_trajectory("b", base_sample=Sample(index=1, prompt=""))[0].metadata["toolcall_turn_shaping"]
+
+    assert sum(vec_a) == pytest.approx(-beta)
+    assert sum(vec_b) == pytest.approx(-beta)
+    # different lengths, identical totals
+    assert len(vec_a) != len(vec_b)
+
+
+def test_error_count_proportionality():
+    """Same token length, 1 error vs 2 errors -> total scales 1:2."""
+
+    def scorer_1(node):
+        return 1
+
+    def scorer_2(node):
+        return 2
+
+    beta = 0.5
+    mgr_a = TrajectoryManager(turn_scorer=scorer_1, shaping_beta=beta, shaping_budget=100.0)
+    _single_turn_session(mgr_a, "a", response_ids=[9001, 9002, 9003])
+    vec_a = mgr_a.get_trajectory("a", base_sample=Sample(index=0, prompt=""))[0].metadata["toolcall_turn_shaping"]
+
+    mgr_b = TrajectoryManager(turn_scorer=scorer_2, shaping_beta=beta, shaping_budget=100.0)
+    _single_turn_session(mgr_b, "b", response_ids=[9001, 9002, 9003])
+    vec_b = mgr_b.get_trajectory("b", base_sample=Sample(index=1, prompt=""))[0].metadata["toolcall_turn_shaping"]
+
+    assert sum(vec_a) == pytest.approx(-beta)
+    assert sum(vec_b) == pytest.approx(-2 * beta)
+    assert sum(vec_b) == pytest.approx(2 * sum(vec_a))
 
 
 def test_adapter_forwards_scorer_to_manager():

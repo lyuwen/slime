@@ -384,44 +384,60 @@ class TrajectoryManager:
     def _apply_turn_shaping(self, pairs: list[tuple[Sample, _SampleBuilder]]) -> None:
         """Write a dense per-token shaping vector to each sample's metadata.
 
-        For every trained turn span, fill -beta * error_count over that span,
-        then cap the summed |shaping| across ALL samples of the session to
-        shaping_budget (proportional scale-down; never scales up). No-op when no
-        scorer is configured or beta == 0.
+        Each trained turn's TOTAL shaping is a fixed ``-beta * error_count``,
+        independent of how many tokens the turn emitted, distributed uniformly
+        over that turn's trainable (loss_mask==1) tokens: ``per_token =
+        (-beta * errors) / N_t``. So ``sum`` over a turn == ``-beta * errors``
+        and two turns with the same error count get the same total penalty
+        regardless of verbosity. The trajectory budget then caps the sum of these
+        fixed per-turn (semantic) penalties across ALL samples of the session
+        (proportional scale-down; never scales up). No-op when no scorer is
+        configured or beta == 0.
         """
         if self._turn_scorer is None or self._shaping_beta == 0.0:
             return
 
-        # Raw penalties per sample, in full-token space (pre first-turn strip).
-        raw_full: list[list[float]] = []
+        # Pass 1: per-turn semantic penalties + their live-token indices, per sample.
+        # A turn's TOTAL penalty is a fixed -beta*errors (length-independent); it is
+        # distributed uniformly over the turn's trainable tokens in pass 2. The budget
+        # is computed in these semantic per-turn units, so it does not depend on how
+        # many tokens a turn happened to emit.
+        per_sample_entries: list[list[tuple[list[int], float]]] = []
+        total_abs = 0.0
         for _sample, builder in pairs:
-            vec = [0.0] * len(builder.tokens)
+            entries: list[tuple[list[int], float]] = []
             for start, length, node, trained in builder.turn_spans:
                 if not trained or length == 0:
                     continue
+                # Only trainable tokens receive gradient, so only they define N_t and
+                # carry shaping. A REALIGN demotes a stale span to loss_mask=0 (and the
+                # span length may exceed the rebuilt buffer), so clamp to len and filter.
+                live_indices = [
+                    i for i in range(start, min(start + length, len(builder.loss_mask))) if builder.loss_mask[i] == 1
+                ]
+                if not live_indices:
+                    continue
                 errors = int(self._turn_scorer(node))
-                if errors:
-                    penalty = -self._shaping_beta * errors
-                    # Only shape live tokens. A REALIGN overwrites a preceding
-                    # response span to loss_mask=0 without removing its (trained)
-                    # turn_spans entry, so a stale span may cover masked-out or
-                    # rewritten-shorter tokens. Respecting the final loss mask here
-                    # keeps those tokens out of the budget denominator and prevents
-                    # mis-attributing penalty to the new response's tokens. Clamp to
-                    # len(vec): the token buffer is rebuilt on REALIGN, so a stale
-                    # span length may exceed the current buffer.
-                    for i in range(start, min(start + length, len(vec))):
-                        if builder.loss_mask[i] == 1:
-                            vec[i] = penalty
-            raw_full.append(vec)
+                if errors <= 0:
+                    continue
+                penalty = -self._shaping_beta * errors  # fixed per-turn total
+                entries.append((live_indices, penalty))
+                total_abs += abs(penalty)
+            per_sample_entries.append(entries)
 
-        total_abs = sum(abs(v) for vec in raw_full for v in vec)
+        # Episode-level cap on total semantic influence (proportional scale-down only).
         scale = (self._shaping_budget / total_abs) if total_abs > self._shaping_budget else 1.0
 
-        for (sample, builder), vec in zip(pairs, raw_full, strict=True):
+        # Pass 2: distribute each (scaled) fixed turn penalty uniformly over its live
+        # tokens, then slice to the sample's response region exactly like loss_mask.
+        for (sample, builder), entries in zip(pairs, per_sample_entries, strict=True):
+            vec = [0.0] * len(builder.tokens)
+            for live_indices, penalty in entries:
+                per_token = (penalty * scale) / len(live_indices)
+                for i in live_indices:
+                    vec[i] += per_token
             start = builder.leading_prompt_len
-            sliced = [v * scale for v in vec[start : start + sample.response_length]]
-            # Guard: to_sample may have truncated; pad/trim to response_length.
+            sliced = vec[start : start + sample.response_length]
             if len(sliced) < sample.response_length:
                 sliced = sliced + [0.0] * (sample.response_length - len(sliced))
             sample.metadata = {**(sample.metadata or {}), "toolcall_turn_shaping": sliced}

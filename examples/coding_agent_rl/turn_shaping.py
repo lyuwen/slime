@@ -24,6 +24,15 @@ logger = logging.getLogger(__name__)
 
 _TOOL_CHECKS = None  # lazily populated dispatch table
 
+# Error types that are observation-derived heuristics, not protocol/schema
+# violations, so they must NOT be penalized (review §18). The annotator appends
+# ``other_error`` for execute_bash / str_replace_editor purely because the tool
+# RESPONSE text contains "Error:", "failed", "cannot", etc. — which fires on
+# legitimate informative observations (a failing pytest, a diagnostic compiler
+# error, a grep printing "cannot ..."). Those are not defects in the model's
+# tool call, so they are excluded from the counted errors.
+_EXCLUDED_ERROR_TYPES = frozenset({"other_error"})
+
 
 def _load_checks():
     """Import the external annotator's pure check functions, once.
@@ -55,11 +64,15 @@ def _as_wire_tool_call(tc: dict) -> dict:
     return {"id": tc.get("id"), "function": {"name": fn.get("name"), "arguments": args}}
 
 
-def count_turn_toolcall_errors(assistant_message: dict, tool_response: dict | None) -> int:
+def count_turn_toolcall_errors(assistant_message: dict, responses_by_id: dict[str, dict] | None) -> int:
     """Total detected tool-call errors across one assistant turn's tool calls.
 
     Dispatches each tool call to the matching annotator ``check_*`` and sums the
-    number of error types returned. Unknown tools and turns without tool calls
+    number of error types returned, looking up EACH call's own tool response by
+    its ``tool_call_id`` in ``responses_by_id`` (calls 2..N in a multi-call turn
+    otherwise get mis-attributed the first response). Observation-derived
+    heuristic errors (``other_error``) are excluded — see
+    ``_EXCLUDED_ERROR_TYPES``. Unknown tools and turns without tool calls
     contribute 0.
     """
     if not assistant_message:
@@ -68,11 +81,14 @@ def count_turn_toolcall_errors(assistant_message: dict, tool_response: dict | No
     if not tool_calls:
         return 0
 
+    responses_by_id = responses_by_id or {}
     impl = _load_checks()
     total = 0
     for tc in tool_calls:
         wire = _as_wire_tool_call(tc)
         name = wire["function"]["name"]
+        # This call's own response, matched by the original tool_call_id.
+        tool_response = responses_by_id.get(tc.get("id"))
         # JSON validity applies to every tool call.
         _, args_valid = impl.parse_arguments(wire)
         if not args_valid:
@@ -85,10 +101,11 @@ def count_turn_toolcall_errors(assistant_message: dict, tool_response: dict | No
         elif name == "think":
             total += len(impl.check_think(wire, tool_response))
         elif name == "str_replace_editor":
-            total += len(impl.check_str_replace_editor(wire, tool_response))
+            errs = impl.check_str_replace_editor(wire, tool_response)
+            total += sum(1 for e in errs if e not in _EXCLUDED_ERROR_TYPES)
         elif name == "execute_bash":
             res = impl.check_execute_bash(wire, tool_response, None)
-            total += len(res.get("errors", []))
+            total += sum(1 for e in res.get("errors", []) if e not in _EXCLUDED_ERROR_TYPES)
         # unknown tools: no check, 0
     return total
 
@@ -97,19 +114,22 @@ def make_turn_scorer():
     """Return a callback scoring one generated assistant turn node.
 
     The callback takes a ``MessageNode`` and returns its errored-tool-call count.
-    It locates the turn's tool response as a ``tool`` child node when present
-    (the follow-up turn mounts it below the assistant); otherwise scores against
-    ``None`` (the annotator tolerates a missing response).
+    It builds a ``tool_call_id -> response`` map from the turn's ``tool`` child
+    nodes so each tool call is scored against its own response (a follow-up turn
+    mounts the responses below the assistant); calls without a matching response
+    are scored against ``None`` (the annotator tolerates a missing response).
     """
 
     def score(node) -> int:
         assistant_message = node.message or {}
-        tool_response = None
+        responses_by_id: dict[str, dict] = {}
         for child in getattr(node, "children", []) or []:
-            if child.role == "tool" and child.message is not None:
-                tool_response = child.message
-                break
-        return count_turn_toolcall_errors(assistant_message, tool_response)
+            if child.role != "tool" or child.message is None:
+                continue
+            tcid = child.message.get("tool_call_id")
+            if tcid is not None:
+                responses_by_id[tcid] = child.message
+        return count_turn_toolcall_errors(assistant_message, responses_by_id)
 
     return score
 

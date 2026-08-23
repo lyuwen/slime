@@ -12,10 +12,10 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 
-def _asst(tool_name, arguments):
+def _asst(tool_name, arguments, tc_id="call_0"):
     return {
         "role": "assistant",
-        "tool_calls": [{"type": "function", "function": {"name": tool_name, "arguments": arguments}}],
+        "tool_calls": [{"id": tc_id, "type": "function", "function": {"name": tool_name, "arguments": arguments}}],
     }
 
 
@@ -24,7 +24,7 @@ def test_count_errors_clean_finish():
     from examples.coding_agent_rl.turn_shaping import count_turn_toolcall_errors
 
     msg = _asst("finish", {"message": "done"})
-    assert count_turn_toolcall_errors(msg, tool_response=None) == 0
+    assert count_turn_toolcall_errors(msg, None) == 0
 
 
 def test_count_errors_malformed_finish():
@@ -32,7 +32,7 @@ def test_count_errors_malformed_finish():
     from examples.coding_agent_rl.turn_shaping import count_turn_toolcall_errors
 
     msg = _asst("finish", {})
-    assert count_turn_toolcall_errors(msg, tool_response=None) >= 1
+    assert count_turn_toolcall_errors(msg, None) >= 1
 
 
 def test_count_errors_no_tool_call():
@@ -40,6 +40,60 @@ def test_count_errors_no_tool_call():
     from examples.coding_agent_rl.turn_shaping import count_turn_toolcall_errors
 
     assert count_turn_toolcall_errors({"role": "assistant", "content": "hi"}, None) == 0
+
+
+def test_count_errors_multi_call_per_id_matching():
+    """P0.3: each tool call is scored against ITS OWN response, matched by
+    tool_call_id — not the first tool child for all calls.
+
+    Two calls in one turn: "a" is a clean str_replace_editor edit, "b" is a
+    malformed str_replace_editor whose own response reports old_str_not_found.
+    Correct per-id matching attributes exactly 1 error (to "b"). The OLD
+    first-child logic passed call "a"'s clean response to every check, so "b"
+    would score 0 and the total would be 0 — this test fails against it.
+    """
+    from examples.coding_agent_rl.turn_shaping import count_turn_toolcall_errors
+
+    msg = {
+        "role": "assistant",
+        "tool_calls": [
+            {
+                "id": "a",
+                "type": "function",
+                "function": {"name": "str_replace_editor", "arguments": {"command": "str_replace", "path": "/x"}},
+            },
+            {
+                "id": "b",
+                "type": "function",
+                "function": {"name": "str_replace_editor", "arguments": {"command": "str_replace", "path": "/y"}},
+            },
+        ],
+    }
+    responses_by_id = {
+        "a": {"role": "tool", "tool_call_id": "a", "content": "The file /x has been edited successfully."},
+        "b": {
+            "role": "tool",
+            "tool_call_id": "b",
+            "content": "No replacement was performed, old_str `foo` did not appear verbatim in /y",
+        },
+    }
+    assert count_turn_toolcall_errors(msg, responses_by_id) == 1
+
+
+def test_count_errors_failing_command_not_a_protocol_error():
+    """P0.4: an execute_bash with a valid invocation whose response is a runtime
+    failure (contains "Error:") scores 0 — ``other_error`` is observation-derived,
+    not a protocol violation. A real protocol violation (reset=True + is_input=True)
+    still counts.
+    """
+    from examples.coding_agent_rl.turn_shaping import count_turn_toolcall_errors
+
+    failing = _asst("execute_bash", {"command": "pytest"}, tc_id="c0")
+    fail_resp = {"c0": {"role": "tool", "tool_call_id": "c0", "content": "Error: 1 test failed (exit code 1)"}}
+    assert count_turn_toolcall_errors(failing, fail_resp) == 0
+
+    violation = _asst("execute_bash", {"command": "x", "reset": True, "is_input": True}, tc_id="c1")
+    assert count_turn_toolcall_errors(violation, None) == 1
 
 
 def test_compute_advantage_adds_shaping():
