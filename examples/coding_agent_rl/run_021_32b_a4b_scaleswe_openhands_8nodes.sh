@@ -17,15 +17,15 @@ SLIME_DIR="${SLIME_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 source "${SLIME_DIR}/scripts/models/021-32B-A4B.sh"
 
 # Params
-export ROLLOUT_BATCH_SIZE=16
-export ROLLOUT_GROUP_SIZE=8
-export GLOBAL_BATCH_SIZE=128
-export ROLLOUT_TP_SIZE=2
-export ROLLOUT_DP_SIZE=1
-export ROLLOUT_EP_SIZE=1
-export ROLLOUT_MEM_UTILIZATION=0.8
-export NUM_EPOCH=1
-export SGLANG_SERVER_CONCURRENCY=4
+export ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-16}
+export ROLLOUT_GROUP_SIZE=${ROLLOUT_GROUP_SIZE:-8}
+export GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-128}
+export ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-2}
+export ROLLOUT_DP_SIZE=${ROLLOUT_DP_SIZE:-1}
+export ROLLOUT_EP_SIZE=${ROLLOUT_EP_SIZE:-1}
+export ROLLOUT_MEM_UTILIZATION=${ROLLOUT_MEM_UTILIZATION:-0.8}
+export NUM_EPOCH=${NUM_EPOCH:-1}
+export SGLANG_SERVER_CONCURRENCY=${SGLANG_SERVER_CONCURRENCY:-4}
 
 # ============ model parallelism ============
 # 8-node, 64-GPU run. PP=8 / EP=8 matches run_8xH20.sh 32B section.
@@ -88,6 +88,7 @@ ROLLOUT_ARGS=(
    --rollout-max-context-len ${MAX_CONTEXT_LEN}
    --rollout-max-response-len ${MAX_GEN_LEN}
    --rollout-temperature 1.0
+   --rollout-top-p ${ROLLOUT_TOP_P:-1.0}
    --rollout-stop-token-ids 128012
    --num-steps-per-rollout 1
    --global-batch-size ${GLOBAL_BATCH_SIZE}
@@ -123,7 +124,7 @@ ALGO_ARGS=(
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr 1e-6
+   --lr ${LEARNING_RATE:-1e-6}
    --lr-decay-style constant
    --weight-decay 0.1
    --adam-beta1 0.9
