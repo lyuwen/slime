@@ -207,5 +207,33 @@ def test_cp_slice_included_for_shaping_key():
     assert abs(idx_shape - idx_loop) < 400, "shaping key not in the same slice loop"
 
 
+def _with_error_count(sample, count):
+    sample.metadata = {**(sample.metadata or {}), "toolcall_error_count": count}
+    return sample
+
+
+def test_toolcall_error_metric_averages_counts():
+    """The rollout metric is the mean raw error count per sample in the batch."""
+    from slime.ray.rollout import _compute_toolcall_error_metrics
+
+    samples = [_with_error_count(_sample(i, 2), c) for i, c in enumerate([0, 1, 2, 3])]
+    assert _compute_toolcall_error_metrics(samples) == {"toolcall_error_count/mean": 1.5}
+
+
+def test_toolcall_error_metric_omitted_when_absent():
+    """No sample carries the count (feature off) -> no metric key at all."""
+    from slime.ray.rollout import _compute_toolcall_error_metrics
+
+    assert _compute_toolcall_error_metrics([_sample(0, 2), _sample(1, 2)]) == {}
+
+
+def test_toolcall_error_metric_ignores_samples_without_count():
+    """Mixed batch: average only over samples that were scored."""
+    from slime.ray.rollout import _compute_toolcall_error_metrics
+
+    samples = [_sample(0, 2), _with_error_count(_sample(1, 2), 4), _with_error_count(_sample(2, 2), 0)]
+    assert _compute_toolcall_error_metrics(samples) == {"toolcall_error_count/mean": 2.0}
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

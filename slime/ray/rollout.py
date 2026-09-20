@@ -1326,6 +1326,7 @@ def compute_metrics_from_samples(args, samples):
     log_dict |= _compute_prefix_cache_metrics(args, samples)
     log_dict |= _compute_reward_cat_metrics(args, samples)
     log_dict |= _compute_top_p_kept_vocab_metrics(args, samples)
+    log_dict |= _compute_toolcall_error_metrics(samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
     return log_dict
@@ -1493,3 +1494,21 @@ def _compute_reward_cat_metrics(args, all_samples: list[Sample]):
     samples_of_reward_cat = group_by(all_samples, lambda s: s.reward[reward_cat_key])
 
     return {f"error_cat/{reward_cat}": len(s) / len(all_samples) for reward_cat, s in samples_of_reward_cat.items()}
+
+
+def _compute_toolcall_error_metrics(all_samples: list[Sample]):
+    """Mean penalized tool-call error count per sample across this rollout batch.
+
+    ``TrajectoryManager`` writes each sample's raw (pre-beta, pre-budget) count
+    next to the shaping vector, using the same ``other_error``-excluding scorer
+    that defines the penalty, so this reports the signal in its semantic unit.
+    Returns ``{}`` when no sample carries the count (feature off).
+    """
+    counts = [
+        sample.metadata["toolcall_error_count"]
+        for sample in all_samples
+        if sample.metadata and "toolcall_error_count" in sample.metadata
+    ]
+    if not counts:
+        return {}
+    return {"toolcall_error_count/mean": float(np.mean(counts))}

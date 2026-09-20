@@ -150,6 +150,7 @@ def test_shaping_absent_when_scorer_none():
     samples = mgr.get_trajectory("sid", base_sample=Sample(index=0, prompt=""), reward=1.0)
     assert len(samples) == 1
     assert "toolcall_turn_shaping" not in (samples[0].metadata or {})
+    assert "toolcall_error_count" not in (samples[0].metadata or {})
 
 
 def test_shaping_penalizes_errored_turn_only():
@@ -176,6 +177,8 @@ def test_shaping_penalizes_errored_turn_only():
     assert abs(sum(vec[-2:]) + 0.5) < 1e-9  # turn total == -beta*errors
     # non-response prompt-tail tokens between the two responses are 0
     assert set(vec[3:-2]) <= {0.0}
+    # the raw count sits next to the vector, in semantic units
+    assert s.metadata["toolcall_error_count"] == 1
 
 
 def test_budget_cap_scales_total():
@@ -257,6 +260,36 @@ def test_error_count_proportionality():
     assert sum(vec_a) == pytest.approx(-beta)
     assert sum(vec_b) == pytest.approx(-2 * beta)
     assert sum(vec_b) == pytest.approx(2 * sum(vec_a))
+
+
+def test_error_count_is_raw_and_budget_independent():
+    """metadata["toolcall_error_count"] is the summed scorer output for the
+    sample, reported before beta scaling and before the budget cap."""
+
+    def scorer(node):
+        return 3
+
+    # Beta and budget both differ, but the semantic count must not: it is the
+    # number of (other_error-excluded) errors the scorer found, full stop.
+    mgr = TrajectoryManager(turn_scorer=scorer, shaping_beta=0.25, shaping_budget=0.01)
+    _two_turn_session(mgr, "sid", r1="a1", r2="a2")
+    s = mgr.get_trajectory("sid", base_sample=Sample(index=0, prompt=""), reward=1.0)[0]
+
+    # Two scored turns x 3 errors each; the tiny budget only scales the vector.
+    assert s.metadata["toolcall_error_count"] == 6
+    assert sum(abs(v) for v in s.metadata["toolcall_turn_shaping"]) == pytest.approx(0.01)
+
+
+def test_error_count_zero_for_clean_trajectory():
+    """A scored-but-clean trajectory records an explicit 0, not a missing key."""
+
+    def scorer(node):
+        return 0
+
+    mgr = TrajectoryManager(turn_scorer=scorer, shaping_beta=0.5, shaping_budget=100.0)
+    _two_turn_session(mgr, "sid", r1="a1", r2="a2")
+    s = mgr.get_trajectory("sid", base_sample=Sample(index=0, prompt=""), reward=1.0)[0]
+    assert s.metadata["toolcall_error_count"] == 0
 
 
 def test_adapter_forwards_scorer_to_manager():

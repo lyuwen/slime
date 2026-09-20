@@ -393,6 +393,10 @@ class TrajectoryManager:
         fixed per-turn (semantic) penalties across ALL samples of the session
         (proportional scale-down; never scales up). No-op when no scorer is
         configured or beta == 0.
+
+        Alongside the vector it writes the sample's raw penalized error count to
+        ``metadata["toolcall_error_count"]`` (pre-beta, pre-budget), so rollout
+        logging can report the signal in its native semantic unit.
         """
         if self._turn_scorer is None or self._shaping_beta == 0.0:
             return
@@ -403,9 +407,11 @@ class TrajectoryManager:
         # is computed in these semantic per-turn units, so it does not depend on how
         # many tokens a turn happened to emit.
         per_sample_entries: list[list[tuple[list[int], float]]] = []
+        per_sample_errors: list[int] = []
         total_abs = 0.0
         for _sample, builder in pairs:
             entries: list[tuple[list[int], float]] = []
+            errors_in_sample = 0
             for start, length, node, trained in builder.turn_spans:
                 if not trained or length == 0:
                     continue
@@ -420,17 +426,21 @@ class TrajectoryManager:
                 errors = int(self._turn_scorer(node))
                 if errors <= 0:
                     continue
+                errors_in_sample += errors
                 penalty = -self._shaping_beta * errors  # fixed per-turn total
                 entries.append((live_indices, penalty))
                 total_abs += abs(penalty)
             per_sample_entries.append(entries)
+            per_sample_errors.append(errors_in_sample)
 
         # Episode-level cap on total semantic influence (proportional scale-down only).
         scale = (self._shaping_budget / total_abs) if total_abs > self._shaping_budget else 1.0
 
         # Pass 2: distribute each (scaled) fixed turn penalty uniformly over its live
         # tokens, then slice to the sample's response region exactly like loss_mask.
-        for (sample, builder), entries in zip(pairs, per_sample_entries, strict=True):
+        for (sample, builder), entries, errors_in_sample in zip(
+            pairs, per_sample_entries, per_sample_errors, strict=True
+        ):
             vec = [0.0] * len(builder.tokens)
             for live_indices, penalty in entries:
                 per_token = (penalty * scale) / len(live_indices)
@@ -440,7 +450,11 @@ class TrajectoryManager:
             sliced = vec[start : start + sample.response_length]
             if len(sliced) < sample.response_length:
                 sliced = sliced + [0.0] * (sample.response_length - len(sliced))
-            sample.metadata = {**(sample.metadata or {}), "toolcall_turn_shaping": sliced}
+            sample.metadata = {
+                **(sample.metadata or {}),
+                "toolcall_turn_shaping": sliced,
+                "toolcall_error_count": errors_in_sample,
+            }
 
     def drop_session(self, sid: str) -> None:
         self._trees.pop(sid, None)
