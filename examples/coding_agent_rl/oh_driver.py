@@ -242,6 +242,7 @@ def main(config_path: str) -> int:
             model="openai/" + cfg.get("model_label", "slime-actor"),
             base_url=cfg["adapter_url"] + "/v1",
             api_key=cfg["session_id"],
+            num_retries=1,
         )
     agent = Agent(
         llm=llm,
