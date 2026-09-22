@@ -341,6 +341,31 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--tool-call-validator-path",
+                type=str,
+                default=None,
+                help=(
+                    "Path to a tool-call validator function used during agentic rollout. "
+                    "Signature: `def validator(response_dict: dict) -> tuple[str, str] | None`, "
+                    "where the input is an OpenAI-shape response dict "
+                    "`{'choices': [{'message': {'tool_calls': [{'function': {'name', 'arguments'}}]}}]}` "
+                    "(arguments is a JSON string) and the return is None when every tool call is "
+                    "valid, or (tool_name, raw_arguments) for the first invalid call. When set, the "
+                    "OpenAI adapter regenerates the assistant turn on an invalid tool call "
+                    "(training rollouts only). Loaded via slime.utils.misc.load_function."
+                ),
+            )
+            parser.add_argument(
+                "--tool-call-max-retries",
+                type=int,
+                default=3,
+                help=(
+                    "Maximum number of regenerations when a tool call is invalid "
+                    "(so up to max_retries + 1 generate calls per turn). "
+                    "Only used when --tool-call-validator-path is set."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-temperature",
                 type=float,
                 default=1.0,

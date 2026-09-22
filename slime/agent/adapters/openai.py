@@ -66,6 +66,20 @@ class OpenAIAdapter(BaseAdapter):
             wire=(wire_message, wire_finish),
         )
 
+    def _validate_reply(self, parsed, session):
+        """Reject a turn whose tool calls fail the configured validator.
+
+        Returns None (accept) when no validator is configured or the session is
+        an eval rollout; otherwise runs the validator over the FULL tool-call
+        list (pre-truncation) in OpenAI response-dict shape.
+        """
+        if self.tool_call_validator is None or session.is_eval:
+            return None
+        if not parsed.tool_uses:
+            return None
+        response_dict = {"choices": [{"message": {"tool_calls": _wire_tool_calls(parsed)}}]}
+        return self.tool_call_validator(response_dict)
+
     async def _respond(self, request, body, reply, in_tok, out_tok, stream, cached_tok: int = 0) -> web.StreamResponse:
         wire_message, wire_finish = reply.wire
         if stream:
@@ -208,6 +222,32 @@ def _tools_to_chat_tools(tools: list[dict] | None) -> list[dict] | None:
 # --- Reply building: parsed output -> OpenAI wire message + manager_message ---
 
 
+def _wire_tool_calls(parsed: ParsedModelOutput) -> list[dict[str, Any]]:
+    """Full list of OpenAI-shape wire tool calls (arguments as JSON strings).
+
+    This is the complete list BEFORE the ``[:1]`` truncation applied when
+    framing the outbound wire/manager messages, so a validator can inspect
+    every tool call the model emitted, not just the first.
+    """
+    calls: list[dict[str, Any]] = []
+    for tu in parsed.tool_uses:
+        name = tu.get("name", "tool")
+        args_dict = tu.get("input") or {}
+        if not isinstance(args_dict, dict):
+            args_dict = {"_raw_arguments": str(args_dict)}
+        calls.append(
+            {
+                "id": f"call_{secrets.token_hex(12)}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args_dict, ensure_ascii=False, sort_keys=True),
+                },
+            }
+        )
+    return calls
+
+
 def _build_reply_parts(parsed: ParsedModelOutput, finish: str) -> tuple[dict[str, Any], dict[str, Any], str]:
     """Return (wire_message, manager_message, wire_finish).
 
@@ -219,33 +259,19 @@ def _build_reply_parts(parsed: ParsedModelOutput, finish: str) -> tuple[dict[str
     chat-template replay succeeds and the manager's history match (dict equality)
     holds against the echo on the next turn, and the wire-only id is omitted.
     """
-    wire_tool_calls: list[dict[str, Any]] = []
-    manager_tool_calls: list[dict[str, Any]] = []
-    for tu in parsed.tool_uses:
-        name = tu.get("name", "tool")
-        args_dict = tu.get("input") or {}
-        if not isinstance(args_dict, dict):
-            args_dict = {"_raw_arguments": str(args_dict)}
-        call_id = f"call_{secrets.token_hex(12)}"
-        wire_tool_calls.append(
-            {
-                "id": call_id,
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(args_dict, ensure_ascii=False, sort_keys=True),
-                },
-            }
-        )
-        manager_tool_calls.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": args_dict,
-                },
-            }
-        )
+    wire_tool_calls = _wire_tool_calls(parsed)
+    manager_tool_calls: list[dict[str, Any]] = [
+        {
+            "type": "function",
+            "function": {
+                "name": call["function"]["name"],
+                # manager_message keeps arguments as a dict (chat-template replay
+                # + dict-equality history match); recover it from the wire JSON.
+                "arguments": json.loads(call["function"]["arguments"]),
+            },
+        }
+        for call in wire_tool_calls
+    ]
 
     wire_message: dict[str, Any] = {
         "role": "assistant",
