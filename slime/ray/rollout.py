@@ -41,6 +41,7 @@ _ROLLOUT_DATA_TENSOR_DTYPES = {
     "tokens": torch.long,
     "loss_masks": torch.int,
     "rollout_log_probs": torch.float32,
+    "toolcall_turn_shaping": torch.float32,
     "rollout_top_p_token_ids": torch.int32,
     "rollout_top_p_token_offsets": torch.int32,
     "teacher_log_probs": torch.float32,
@@ -789,6 +790,13 @@ class RolloutManager:
         if samples[0].rollout_log_probs is not None:
             train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
 
+        # Add per-token toolcall-correctness shaping when present (feature off by default)
+        if any(sample.metadata and "toolcall_turn_shaping" in sample.metadata for sample in samples):
+            train_data["toolcall_turn_shaping"] = [
+                (sample.metadata or {}).get("toolcall_turn_shaping", [0.0] * sample.response_length)
+                for sample in samples
+            ]
+
         if getattr(self.args, "rollout_top_p", 1.0) != 1.0:
             for sample in samples:
                 assert sample.rollout_top_p_token_ids is not None
@@ -866,6 +874,7 @@ class RolloutManager:
                 "rollout_ids",
                 "rollout_mask_sums",
                 "rollout_log_probs",
+                "toolcall_turn_shaping",
                 "rollout_top_p_token_ids",
                 "rollout_top_p_token_offsets",
                 "rollout_routed_experts",
@@ -1317,6 +1326,7 @@ def compute_metrics_from_samples(args, samples):
     log_dict |= _compute_prefix_cache_metrics(args, samples)
     log_dict |= _compute_reward_cat_metrics(args, samples)
     log_dict |= _compute_top_p_kept_vocab_metrics(args, samples)
+    log_dict |= _compute_toolcall_error_metrics(samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
     return log_dict
@@ -1484,3 +1494,21 @@ def _compute_reward_cat_metrics(args, all_samples: list[Sample]):
     samples_of_reward_cat = group_by(all_samples, lambda s: s.reward[reward_cat_key])
 
     return {f"error_cat/{reward_cat}": len(s) / len(all_samples) for reward_cat, s in samples_of_reward_cat.items()}
+
+
+def _compute_toolcall_error_metrics(all_samples: list[Sample]):
+    """Mean penalized tool-call error count per sample across this rollout batch.
+
+    ``TrajectoryManager`` writes each sample's raw (pre-beta, pre-budget) count
+    next to the shaping vector, using the same ``other_error``-excluding scorer
+    that defines the penalty, so this reports the signal in its semantic unit.
+    Returns ``{}`` when no sample carries the count (feature off).
+    """
+    counts = [
+        sample.metadata["toolcall_error_count"]
+        for sample in all_samples
+        if sample.metadata and "toolcall_error_count" in sample.metadata
+    ]
+    if not counts:
+        return {}
+    return {"toolcall_error_count/mean": float(np.mean(counts))}

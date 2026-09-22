@@ -270,7 +270,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 for mm_dict in rollout_data["multimodal_train_inputs"]
             ]
 
-        for key in ["rollout_log_probs", "teacher_log_probs"]:
+        for key in ["rollout_log_probs", "teacher_log_probs", "toolcall_turn_shaping"]:
             if key not in rollout_data:
                 continue
             rollout_data[key] = [
